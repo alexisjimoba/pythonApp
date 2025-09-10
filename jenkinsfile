@@ -8,11 +8,15 @@ pipeline {
 
   environment {
     APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform'   // ajusta si tu Terraform vive en otra carpeta
+    TF_WORKDIR    = 'infra/terraform'
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
-    // SonarQube opcional (no usamos token)
+    // bin local para instalar utilidades sin sudo
+    LOCAL_BIN     = "${WORKSPACE}/.bin"
+    PATH          = "${LOCAL_BIN}:${PATH}"
+
+    // Sonar opcional
     SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
   }
@@ -22,12 +26,9 @@ pipeline {
     stage('Checkout') {
       steps {
         ansiColor('xterm') {
-          // Repo PÚBLICO + limpieza de workspace y del .git previo
           checkout([$class: 'GitSCM',
             branches: [[name: '*/main']],
-            userRemoteConfigs: [[
-              url: 'https://github.com/alexisjimoba/pythonApp.git'
-            ]],
+            userRemoteConfigs: [[ url: 'https://github.com/alexisjimoba/pythonApp.git' ]],
             extensions: [
               [$class: 'WipeWorkspace'],
               [$class: 'CleanBeforeCheckout']
@@ -35,8 +36,7 @@ pipeline {
           ])
           sh '''#!/bin/bash
             set -euxo pipefail
-            echo "== Entorno =="
-            printenv | sort
+            echo "== Entorno ==" && printenv | sort
           '''
         }
       }
@@ -48,11 +48,23 @@ pipeline {
           sh '''#!/bin/bash
             set -euxo pipefail
 
-            # Instalar tfsec (binario)
-            curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+            # --- Preparar binario local sin sudo ---
+            mkdir -p "${LOCAL_BIN}"
+
+            # 1) tfsec SIN sudo => descarga directa al bin local
+            #   - URL "latest" resuelve a la versión más reciente de GitHub Releases.
+            #   - Si el agente es arm64 cambia a tfsec-linux-arm64.
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
+            else
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
+            fi
+            curl -fsSL "$TSEC_URL" -o "${LOCAL_BIN}/tfsec"
+            chmod +x "${LOCAL_BIN}/tfsec"
             tfsec --version
 
-            # Python venv + checkov
+            # 2) Python venv + checkov
             python3 -m venv .venv
             source .venv/bin/activate
             pip install --upgrade pip
@@ -106,7 +118,6 @@ pipeline {
                 sh '''#!/bin/bash
                   set -euxo pipefail
                   if command -v sonar-scanner >/dev/null 2>&1; then
-                    # Sin -Dsonar.login: Jenkins usa credenciales del server configurado
                     sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
                   else
                     echo "sonar-scanner no encontrado; omitiendo SonarQube"
