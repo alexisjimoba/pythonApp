@@ -10,13 +10,10 @@ pipeline {
     APP_NAME      = 'mi-servicio'
     TF_WORKDIR    = 'infra/terraform'
 
-    NODEJS_HOME   = tool name: 'node20', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'
-    PATH          = "${NODEJS_HOME}/bin:${PATH}"
-
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
-    SONARQUBE_ENV = 'SonarQubeServer' // si lo usas configurado en Jenkins
+    SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
   }
 
@@ -40,19 +37,16 @@ pipeline {
           sh '''
             set -euxo pipefail
 
+            # tfsec (binario)
             curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
             tfsec --version
 
+            # Python venv + checkov
             python3 -m venv .venv
             . .venv/bin/activate
             pip install --upgrade pip
             pip install checkov
             checkov --version
-
-            if [ -f package.json ]; then
-              npm ci || npm i
-              npx eslint -v || npm i -D eslint
-            fi
           '''
         }
       }
@@ -65,9 +59,11 @@ pipeline {
             set -euxo pipefail
             mkdir -p reports
 
+            # tfsec → SARIF + JSON
             tfsec --soft-fail --format sarif --out reports/tfsec.sarif ${TF_WORKDIR}
             tfsec --soft-fail --format json  --out reports/tfsec.json  ${TF_WORKDIR}
 
+            # checkov → SARIF + JUnit
             . .venv/bin/activate
             checkov -d ${TF_WORKDIR} --soft-fail --output sarif    > reports/checkov.sarif
             checkov -d ${TF_WORKDIR} --soft-fail --output junitxml > reports/checkov.junit.xml
@@ -89,31 +85,20 @@ pipeline {
       }
     }
 
-    stage('Optional: App Scan (ESLint/Sonar)') {
+    stage('Optional: SonarQube') {
       when {
-        anyOf {
-          expression { fileExists('package.json') }
-          expression { fileExists('sonar-project.properties') }
-        }
+        expression { fileExists('sonar-project.properties') }
       }
       steps {
         ansiColor('xterm') {
-          sh '''
-            set -euxo pipefail
-            mkdir -p reports
-
-            if [ -f package.json ]; then
-              npx eslint . -f junit -o reports/eslint.junit.xml || true
-            fi
-          '''
           script {
             try {
               withSonarQubeEnv("${SONARQUBE_ENV}") {
                 sh '''
-                  if [ -f sonar-project.properties ] && command -v sonar-scanner >/dev/null 2>&1; then
+                  if command -v sonar-scanner >/dev/null 2>&1; then
                     sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
                   else
-                    echo "sonar-scanner o sonar-project.properties no disponibles; omitiendo SonarQube"
+                    echo "sonar-scanner no encontrado; omitiendo SonarQube"
                   fi
                 '''
               }
@@ -126,7 +111,6 @@ pipeline {
       post {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
-          junit testResults: 'reports/eslint.junit.xml', allowEmptyResults: true
         }
       }
     }
