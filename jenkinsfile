@@ -3,25 +3,20 @@ pipeline {
 
   options {
     skipDefaultCheckout(true)
-    wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm']) // <- reemplaza ansiColor('xterm')
     timestamps()
   }
 
   environment {
-    // Workspace/env
     APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform' // ajusta si tu Terraform vive en otra carpeta
+    TF_WORKDIR    = 'infra/terraform'
 
-    // Si configuraste NodeJS como tool (opcional para ESLint)
     NODEJS_HOME   = tool name: 'node20', type: 'jenkins.plugins.nodejs.tools.NodeJSInstallation'
     PATH          = "${NODEJS_HOME}/bin:${PATH}"
 
-    // Ejemplo de variables para Terraform
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
-    // SonarQube (opcional)
-    SONARQUBE_ENV = 'SonarQubeServer' // nombre del server en "Configure System"
+    SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
     SONAR_TOKEN   = credentials('sonar-token')
   }
@@ -29,61 +24,66 @@ pipeline {
   stages {
     stage('Checkout') {
       steps {
-        checkout([$class: 'GitSCM',
-          branches: [[name: '*/main']],
-          userRemoteConfigs: [[url: 'https://github.com/tu-org/tu-repo.git', credentialsId: 'git-cred']],
-          extensions: [[$class: 'SubmoduleOption', recursiveSubmodules: true]]
-        ])
-        sh 'echo "== Entorno ==" && printenv | sort'
+        ansiColor('xterm') {
+          checkout([$class: 'GitSCM',
+            branches: [[name: '*/main']],
+            userRemoteConfigs: [[url: 'https://github.com/tu-org/tu-repo.git', credentialsId: 'git-cred']],
+            extensions: [[$class: 'SubmoduleOption', recursiveSubmodules: true]]
+          ])
+          sh 'echo "== Entorno ==" && printenv | sort'
+        }
       }
     }
 
     stage('Setup Tooling') {
       steps {
-        sh '''
-          set -euxo pipefail
+        ansiColor('xterm') {
+          sh '''
+            set -euxo pipefail
 
-          # tfsec (binario)
-          curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
-          tfsec --version
+            # tfsec (binario)
+            curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+            tfsec --version
 
-          # Python venv + checkov
-          python3 -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          pip install checkov
-          checkov --version
+            # Python venv + checkov
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install checkov
+            checkov --version
 
-          # Opcional: Node/ESLint si hay app JS/TS
-          if [ -f package.json ]; then
-            npm ci || npm i
-            npx eslint -v || npm i -D eslint
-          fi
-        '''
+            # Opcional: Node/ESLint
+            if [ -f package.json ]; then
+              npm ci || npm i
+              npx eslint -v || npm i -D eslint
+            fi
+          '''
+        }
       }
     }
 
     stage('Static Code Analysis: Terraform') {
       steps {
-        sh '''
-          set -euxo pipefail
-          mkdir -p reports
+        ansiColor('xterm') {
+          sh '''
+            set -euxo pipefail
+            mkdir -p reports
 
-          # tfsec → SARIF + JSON
-          tfsec --soft-fail --format sarif --out reports/tfsec.sarif ${TF_WORKDIR}
-          tfsec --soft-fail --format json  --out reports/tfsec.json  ${TF_WORKDIR}
+            # tfsec → SARIF + JSON
+            tfsec --soft-fail --format sarif --out reports/tfsec.sarif ${TF_WORKDIR}
+            tfsec --soft-fail --format json  --out reports/tfsec.json  ${TF_WORKDIR}
 
-          # checkov → SARIF + JUnit
-          . .venv/bin/activate
-          checkov -d ${TF_WORKDIR} --soft-fail --output sarif    > reports/checkov.sarif
-          checkov -d ${TF_WORKDIR} --soft-fail --output junitxml > reports/checkov.junit.xml
-        '''
+            # checkov → SARIF + JUnit
+            . .venv/bin/activate
+            checkov -d ${TF_WORKDIR} --soft-fail --output sarif    > reports/checkov.sarif
+            checkov -d ${TF_WORKDIR} --soft-fail --output junitxml > reports/checkov.junit.xml
+          '''
+        }
       }
       post {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          // Requiere "Warnings Next Generation" (recordIssues + sarif)
           script {
             try {
               recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
@@ -103,33 +103,35 @@ pipeline {
         }
       }
       steps {
-        sh '''
-          set -euxo pipefail
-          mkdir -p reports
+        ansiColor('xterm') {
+          sh '''
+            set -euxo pipefail
+            mkdir -p reports
 
-          # ESLint → JUnit (no falla el build)
-          if [ -f package.json ]; then
-            npx eslint . -f junit -o reports/eslint.junit.xml || true
-          fi
-        '''
-        // SonarQube (requiere plugin SonarQube y sonar-scanner en el agente)
-        script {
-          try {
-            withSonarQubeEnv("${SONARQUBE_ENV}") {
-              sh '''
-                if [ -f sonar-project.properties ]; then
-                  if command -v sonar-scanner >/dev/null 2>&1; then
-                    sonar-scanner \
-                      -Dsonar.projectKey="${SONAR_PROJECT}" \
-                      -Dsonar.login="${SONAR_TOKEN}"
-                  else
-                    echo "sonar-scanner no encontrado; omitiendo SonarQube"
+            # ESLint → JUnit (no falla el build)
+            if [ -f package.json ]; then
+              npx eslint . -f junit -o reports/eslint.junit.xml || true
+            fi
+          '''
+          // SonarQube
+          script {
+            try {
+              withSonarQubeEnv("${SONARQUBE_ENV}") {
+                sh '''
+                  if [ -f sonar-project.properties ]; then
+                    if command -v sonar-scanner >/dev/null 2>&1; then
+                      sonar-scanner \
+                        -Dsonar.projectKey="${SONAR_PROJECT}" \
+                        -Dsonar.login="${SONAR_TOKEN}"
+                    else
+                      echo "sonar-scanner no encontrado; omitiendo SonarQube"
+                    fi
                   fi
-                fi
-              '''
+                '''
+              }
+            } catch (err) {
+              echo "withSonarQubeEnv no disponible (plugin SonarQube?): ${err}"
             }
-          } catch (err) {
-            echo "withSonarQubeEnv no disponible (plugin SonarQube?): ${err}"
           }
         }
       }
