@@ -17,19 +17,15 @@ pipeline {
     SONAR_PROJECT = 'org:mi-servicio'
   }
 
-  stages {
-    stage('Checkout') {
-      steps {
-        ansiColor('xterm') {
-          checkout([$class: 'GitSCM',
-            branches: [[name: '*/main']],
-            userRemoteConfigs: [[url: 'https://github.com/tu-org/tu-repo.git', credentialsId: 'git-cred']],
-            extensions: [[$class: 'SubmoduleOption', recursiveSubmodules: true]]
-          ])
-          sh 'echo "== Entorno ==" && printenv | sort'
-        }
-      }
+stage('Checkout') {
+  steps {
+    ansiColor('xterm') {
+      git branch: 'main', url: 'https://github.com/alexisjimoba/pythonApp.git'
+      sh 'echo "== Entorno ==" && printenv | sort'
     }
+  }
+}
+
 
     stage('Setup Tooling') {
       steps {
