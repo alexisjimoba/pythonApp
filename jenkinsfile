@@ -8,24 +8,27 @@ pipeline {
 
   environment {
     APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform'
+    TF_WORKDIR    = 'infra/terraform'   // ajusta si tu Terraform vive en otra carpeta
 
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
+    // SonarQube (opcional; no se usa token)
     SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
   }
 
-stage('Checkout') {
-  steps {
-    ansiColor('xterm') {
-      git branch: 'main', url: 'https://github.com/alexisjimoba/pythonApp.git'
-      sh 'echo "== Entorno ==" && printenv | sort'
-    }
-  }
-}
+  stages {
 
+    stage('Checkout') {
+      steps {
+        ansiColor('xterm') {
+          // Repo PUBLICO: sin credentialsId
+          git branch: 'main', url: 'https://github.com/tu-org/tu-repo.git'
+          sh 'echo "== Entorno ==" && printenv | sort'
+        }
+      }
+    }
 
     stage('Setup Tooling') {
       steps {
@@ -33,7 +36,7 @@ stage('Checkout') {
           sh '''
             set -euxo pipefail
 
-            # tfsec (binario)
+            # Instalar tfsec (binario)
             curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
             tfsec --version
 
@@ -55,11 +58,11 @@ stage('Checkout') {
             set -euxo pipefail
             mkdir -p reports
 
-            # tfsec → SARIF + JSON
+            # tfsec → SARIF + JSON (no rompe el build)
             tfsec --soft-fail --format sarif --out reports/tfsec.sarif ${TF_WORKDIR}
             tfsec --soft-fail --format json  --out reports/tfsec.json  ${TF_WORKDIR}
 
-            # checkov → SARIF + JUnit
+            # checkov → SARIF + JUnit (no rompe el build)
             . .venv/bin/activate
             checkov -d ${TF_WORKDIR} --soft-fail --output sarif    > reports/checkov.sarif
             checkov -d ${TF_WORKDIR} --soft-fail --output junitxml > reports/checkov.junit.xml
@@ -70,11 +73,12 @@ stage('Checkout') {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
+          // Publica SARIF si tienes el plugin "Warnings Next Generation"
           script {
             try {
               recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
             } catch (err) {
-              echo "recordIssues no disponible (plugin faltante?): ${err}"
+              echo "recordIssues/SARIF no disponible (¿falta plugin Warnings NG?): ${err}"
             }
           }
         }
@@ -92,6 +96,7 @@ stage('Checkout') {
               withSonarQubeEnv("${SONARQUBE_ENV}") {
                 sh '''
                   if command -v sonar-scanner >/dev/null 2>&1; then
+                    # Sin -Dsonar.login: Jenkins inyecta credenciales del server configurado
                     sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
                   else
                     echo "sonar-scanner no encontrado; omitiendo SonarQube"
@@ -99,7 +104,7 @@ stage('Checkout') {
                 '''
               }
             } catch (err) {
-              echo "SonarQube no configurado: ${err}"
+              echo "SonarQube no configurado o plugin ausente: ${err}"
             }
           }
         }
