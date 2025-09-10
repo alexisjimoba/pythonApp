@@ -1,5 +1,10 @@
 pipeline {
-  agent any
+  agent {
+    docker {
+      image 'python:3.11-slim'
+      args '-u root'
+    }
+  }
 
   options {
     skipDefaultCheckout(true)
@@ -7,25 +12,33 @@ pipeline {
   }
 
   environment {
-    APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform'
-    TF_VAR_env    = 'dev'
+    APP_NAME    = 'mi-servicio'
+    TF_WORKDIR  = 'terraform'      // ← Opción 1: ruta correcta
+    TF_VAR_env  = 'dev'
     TF_VAR_region = 'us-central1'
 
-    // bin local para instalar utilidades sin sudo
-    LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${LOCAL_BIN}:${PATH}"
-
-    // Sonar opcional
-    SONARQUBE_ENV = 'SonarQubeServer'
-    SONAR_PROJECT = 'org:mi-servicio'
+    LOCAL_BIN = "${WORKSPACE}/.bin"
+    PATH      = "${LOCAL_BIN}:${PATH}"
   }
 
   stages {
 
+    stage('Bootstrap container deps') {
+      steps {
+        sh '''#!/bin/bash
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates bash
+          rm -rf /var/lib/apt/lists/*
+        '''
+      }
+    }
+
     stage('Checkout') {
       steps {
         ansiColor('xterm') {
+          // Repo PUBLICO sin credenciales
           checkout([$class: 'GitSCM',
             branches: [[name: '*/main']],
             userRemoteConfigs: [[ url: 'https://github.com/alexisjimoba/pythonApp.git' ]],
@@ -37,6 +50,9 @@ pipeline {
           sh '''#!/bin/bash
             set -euxo pipefail
             echo "== Entorno ==" && printenv | sort
+            git --version
+            python3 --version
+            pip --version
           '''
         }
       }
@@ -47,13 +63,9 @@ pipeline {
         ansiColor('xterm') {
           sh '''#!/bin/bash
             set -euxo pipefail
-
-            # --- Preparar binario local sin sudo ---
             mkdir -p "${LOCAL_BIN}"
 
-            # 1) tfsec SIN sudo => descarga directa al bin local
-            #   - URL "latest" resuelve a la versión más reciente de GitHub Releases.
-            #   - Si el agente es arm64 cambia a tfsec-linux-arm64.
+            # tfsec (amd64/arm64) sin sudo en ${LOCAL_BIN}
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
               TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
@@ -64,7 +76,7 @@ pipeline {
             chmod +x "${LOCAL_BIN}/tfsec"
             tfsec --version
 
-            # 2) Python venv + checkov
+            # venv + checkov
             python3 -m venv .venv
             source .venv/bin/activate
             pip install --upgrade pip
@@ -82,14 +94,27 @@ pipeline {
             set -euxo pipefail
             mkdir -p reports
 
-            # tfsec → SARIF + JSON (no rompe el build)
-            tfsec --soft-fail --format sarif --out reports/tfsec.sarif "${TF_WORKDIR}"
-            tfsec --soft-fail --format json  --out reports/tfsec.json  "${TF_WORKDIR}"
+            # --- Autodetección robusta de carpeta Terraform ---
+            TARGET="${TF_WORKDIR}"
+            if [ ! -d "${TARGET}" ]; then
+              if [ -d "terraform" ]; then TARGET="terraform"
+              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+              else TARGET="."; fi
+            fi
 
-            # checkov → SARIF + JUnit (no rompe el build)
+            # ¿Hay archivos *.tf en la ruta elegida?
+            if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
+              echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando análisis IaC."
+              exit 0
+            fi
+
+            echo "🔎 Escaneando Terraform en: ${TARGET}"
+            tfsec --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}"
+            tfsec --soft-fail --format json  --out reports/tfsec.json  "${TARGET}"
+
             source .venv/bin/activate
-            checkov -d "${TF_WORKDIR}" --soft-fail --output sarif    > reports/checkov.sarif
-            checkov -d "${TF_WORKDIR}" --soft-fail --output junitxml > reports/checkov.junit.xml
+            checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif
+            checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml
           '''
         }
       }
@@ -101,45 +126,16 @@ pipeline {
             try {
               recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
             } catch (err) {
-              echo "recordIssues/SARIF no disponible (¿falta plugin Warnings NG?): ${err}"
+              echo "recordIssues/SARIF no disponible (¿Warnings NG no instalado?): ${err}"
             }
           }
-        }
-      }
-    }
-
-    stage('Optional: SonarQube') {
-      when { expression { fileExists('sonar-project.properties') } }
-      steps {
-        ansiColor('xterm') {
-          script {
-            try {
-              withSonarQubeEnv("${SONARQUBE_ENV}") {
-                sh '''#!/bin/bash
-                  set -euxo pipefail
-                  if command -v sonar-scanner >/dev/null 2>&1; then
-                    sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
-                  else
-                    echo "sonar-scanner no encontrado; omitiendo SonarQube"
-                  fi
-                '''
-              }
-            } catch (err) {
-              echo "SonarQube no configurado o plugin ausente: ${err}"
-            }
-          }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/*', fingerprint: true
         }
       }
     }
   }
 
   post {
-    success { echo "✅ Análisis estático completado." }
-    always  { echo "📦 Reportes en el directorio 'reports/'." }
+    success { echo "✅ Pipeline OK (IaC escaneado si había Terraform)." }
+    always  { echo "📦 Reportes en 'reports/' (si hubo análisis)." }
   }
 }
