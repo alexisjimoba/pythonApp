@@ -9,11 +9,10 @@ pipeline {
   environment {
     APP_NAME      = 'mi-servicio'
     TF_WORKDIR    = 'infra/terraform'   // ajusta si tu Terraform vive en otra carpeta
-
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
-    // SonarQube (opcional; no se usa token)
+    // SonarQube opcional (no usamos token)
     SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
   }
@@ -23,8 +22,17 @@ pipeline {
     stage('Checkout') {
       steps {
         ansiColor('xterm') {
-          // Repo PUBLICO: sin credentialsId
-          git branch: 'main', url: 'https://github.com/tu-org/tu-repo.git'
+          // Repo PÚBLICO + limpieza de workspace y del .git previo
+          checkout([$class: 'GitSCM',
+            branches: [[name: '*/main']],
+            userRemoteConfigs: [[
+              url: 'https://github.com/alexisjimoba/pythonApp.git'
+            ]],
+            extensions: [
+              [$class: 'WipeWorkspace'],
+              [$class: 'CleanBeforeCheckout']
+            ]
+          ])
           sh 'echo "== Entorno ==" && printenv | sort'
         }
       }
@@ -73,7 +81,6 @@ pipeline {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          // Publica SARIF si tienes el plugin "Warnings Next Generation"
           script {
             try {
               recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
@@ -86,9 +93,7 @@ pipeline {
     }
 
     stage('Optional: SonarQube') {
-      when {
-        expression { fileExists('sonar-project.properties') }
-      }
+      when { expression { fileExists('sonar-project.properties') } }
       steps {
         ansiColor('xterm') {
           script {
@@ -96,7 +101,6 @@ pipeline {
               withSonarQubeEnv("${SONARQUBE_ENV}") {
                 sh '''
                   if command -v sonar-scanner >/dev/null 2>&1; then
-                    # Sin -Dsonar.login: Jenkins inyecta credenciales del server configurado
                     sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
                   else
                     echo "sonar-scanner no encontrado; omitiendo SonarQube"
