@@ -1,5 +1,11 @@
 pipeline {
-  agent any
+  agent {
+    docker {
+      image 'python:3.11-slim'
+      // root para poder apt-get dentro del contenedor
+      args '-u root'
+    }
+  }
 
   options {
     skipDefaultCheckout(true)
@@ -7,25 +13,40 @@ pipeline {
   }
 
   environment {
-    APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform'
+    APP_NAME   = 'mi-servicio'
+    TF_WORKDIR = 'infra/terraform'         // ajusta si tu Terraform vive en otra carpeta
+
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
 
-    // bin local para instalar utilidades sin sudo
-    LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${LOCAL_BIN}:${PATH}"
+    // bin local sin sudo
+    LOCAL_BIN = "${WORKSPACE}/.bin"
+    PATH      = "${LOCAL_BIN}:${PATH}"
 
-    // Sonar opcional
+    // Sonar opcional (sin token). Si no lo usas, borra el stage.
     SONARQUBE_ENV = 'SonarQubeServer'
     SONAR_PROJECT = 'org:mi-servicio'
   }
 
   stages {
 
+    stage('Bootstrap container deps') {
+      steps {
+        // Instalamos herramientas base DENTRO del contenedor
+        sh '''#!/bin/bash
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates bash
+          rm -rf /var/lib/apt/lists/*
+        '''
+      }
+    }
+
     stage('Checkout') {
       steps {
         ansiColor('xterm') {
+          // Repo público SIN credenciales
           checkout([$class: 'GitSCM',
             branches: [[name: '*/main']],
             userRemoteConfigs: [[ url: 'https://github.com/alexisjimoba/pythonApp.git' ]],
@@ -36,7 +57,11 @@ pipeline {
           ])
           sh '''#!/bin/bash
             set -euxo pipefail
-            echo "== Entorno ==" && printenv | sort
+            echo "== Entorno =="
+            printenv | sort
+            git --version
+            python3 --version
+            pip --version
           '''
         }
       }
@@ -48,12 +73,10 @@ pipeline {
           sh '''#!/bin/bash
             set -euxo pipefail
 
-            # --- Preparar binario local sin sudo ---
+            # --- bin local sin sudo ---
             mkdir -p "${LOCAL_BIN}"
 
-            # 1) tfsec SIN sudo => descarga directa al bin local
-            #   - URL "latest" resuelve a la versión más reciente de GitHub Releases.
-            #   - Si el agente es arm64 cambia a tfsec-linux-arm64.
+            # 1) tfsec binario local (amd64/arm64)
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
               TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
