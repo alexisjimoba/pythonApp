@@ -33,7 +33,11 @@ pipeline {
               [$class: 'CleanBeforeCheckout']
             ]
           ])
-          sh 'echo "== Entorno ==" && printenv | sort'
+          sh '''#!/bin/bash
+            set -euxo pipefail
+            echo "== Entorno =="
+            printenv | sort
+          '''
         }
       }
     }
@@ -41,7 +45,7 @@ pipeline {
     stage('Setup Tooling') {
       steps {
         ansiColor('xterm') {
-          sh '''
+          sh '''#!/bin/bash
             set -euxo pipefail
 
             # Instalar tfsec (binario)
@@ -50,7 +54,7 @@ pipeline {
 
             # Python venv + checkov
             python3 -m venv .venv
-            . .venv/bin/activate
+            source .venv/bin/activate
             pip install --upgrade pip
             pip install checkov
             checkov --version
@@ -62,18 +66,18 @@ pipeline {
     stage('Static Code Analysis: Terraform') {
       steps {
         ansiColor('xterm') {
-          sh '''
+          sh '''#!/bin/bash
             set -euxo pipefail
             mkdir -p reports
 
             # tfsec → SARIF + JSON (no rompe el build)
-            tfsec --soft-fail --format sarif --out reports/tfsec.sarif ${TF_WORKDIR}
-            tfsec --soft-fail --format json  --out reports/tfsec.json  ${TF_WORKDIR}
+            tfsec --soft-fail --format sarif --out reports/tfsec.sarif "${TF_WORKDIR}"
+            tfsec --soft-fail --format json  --out reports/tfsec.json  "${TF_WORKDIR}"
 
             # checkov → SARIF + JUnit (no rompe el build)
-            . .venv/bin/activate
-            checkov -d ${TF_WORKDIR} --soft-fail --output sarif    > reports/checkov.sarif
-            checkov -d ${TF_WORKDIR} --soft-fail --output junitxml > reports/checkov.junit.xml
+            source .venv/bin/activate
+            checkov -d "${TF_WORKDIR}" --soft-fail --output sarif    > reports/checkov.sarif
+            checkov -d "${TF_WORKDIR}" --soft-fail --output junitxml > reports/checkov.junit.xml
           '''
         }
       }
@@ -99,8 +103,10 @@ pipeline {
           script {
             try {
               withSonarQubeEnv("${SONARQUBE_ENV}") {
-                sh '''
+                sh '''#!/bin/bash
+                  set -euxo pipefail
                   if command -v sonar-scanner >/dev/null 2>&1; then
+                    # Sin -Dsonar.login: Jenkins usa credenciales del server configurado
                     sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
                   else
                     echo "sonar-scanner no encontrado; omitiendo SonarQube"
