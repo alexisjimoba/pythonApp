@@ -3,7 +3,7 @@ pipeline {
 
   options {
     skipDefaultCheckout(true)
-    ansiColor('xterm')
+    wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm']) // <- reemplaza ansiColor('xterm')
     timestamps()
   }
 
@@ -83,7 +83,14 @@ pipeline {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
+          // Requiere "Warnings Next Generation" (recordIssues + sarif)
+          script {
+            try {
+              recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
+            } catch (err) {
+              echo "recordIssues no disponible (plugin faltante?): ${err}"
+            }
+          }
         }
       }
     }
@@ -105,19 +112,25 @@ pipeline {
             npx eslint . -f junit -o reports/eslint.junit.xml || true
           fi
         '''
-        // SonarQube (requiere sonar-scanner instalado en el agente o tool)
-        withSonarQubeEnv("${SONARQUBE_ENV}") {
-          sh '''
-            if [ -f sonar-project.properties ]; then
-              if command -v sonar-scanner >/dev/null 2>&1; then
-                sonar-scanner \
-                  -Dsonar.projectKey="${SONAR_PROJECT}" \
-                  -Dsonar.login="${SONAR_TOKEN}"
-              else
-                echo "sonar-scanner no encontrado; omitiendo SonarQube"
-              fi
-            fi
-          '''
+        // SonarQube (requiere plugin SonarQube y sonar-scanner en el agente)
+        script {
+          try {
+            withSonarQubeEnv("${SONARQUBE_ENV}") {
+              sh '''
+                if [ -f sonar-project.properties ]; then
+                  if command -v sonar-scanner >/dev/null 2>&1; then
+                    sonar-scanner \
+                      -Dsonar.projectKey="${SONAR_PROJECT}" \
+                      -Dsonar.login="${SONAR_TOKEN}"
+                  else
+                    echo "sonar-scanner no encontrado; omitiendo SonarQube"
+                  fi
+                fi
+              '''
+            }
+          } catch (err) {
+            echo "withSonarQubeEnv no disponible (plugin SonarQube?): ${err}"
+          }
         }
       }
       post {
