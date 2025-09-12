@@ -1,10 +1,5 @@
 pipeline {
-  agent {
-    docker {
-      image 'python:3.11-slim'
-      args '-u root'
-    }
-  }
+  agent any
 
   options {
     timestamps()
@@ -17,57 +12,58 @@ pipeline {
   }
 
   environment {
-    // Rutas y PATH local para binarios sin sudo
     LOCAL_BIN   = "${WORKSPACE}/.bin"
     PATH        = "${LOCAL_BIN}:${PATH}"
 
-    // Terraform
     TF_WORKDIR  = 'terraform'
-    TF_VERSION  = '1.6.6' // cámbialo si quieres otra versión
+    TF_VERSION  = '1.6.6'
 
-    // Variables de ejemplo
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
   }
 
   stages {
 
-    stage('Bootstrap container deps') {
+    stage('Bootstrap deps (Linux)') {
       steps {
-        sh '''#!/bin/bash
-          set -euxo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git curl ca-certificates bash unzip
-          rm -rf /var/lib/apt/lists/*
-        '''
-      }
-    }
-
-    stage('Checkout') {
-      steps {
-        // Si tu job NO es multibranch, reemplaza por:
-        // git branch: 'main', url: 'https://github.com/<org>/<repo>.git'
-        checkout scm
         ansiColor('xterm') {
           sh '''#!/bin/bash
             set -euxo pipefail
-            echo "== Entorno ==" && printenv | sort
-            git --version || true
-            python3 --version || true
+            # Instala herramientas base en el nodo/contendor Jenkins
+            # (si no tienes permisos, instala previamente en la imagen del nodo)
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              git curl ca-certificates bash unzip python3 python3-venv python3-pip
+            rm -rf /var/lib/apt/lists/*
           '''
         }
       }
     }
 
-    stage('Setup Tooling (tfsec / checkov / terraform)') {
+    stage('Checkout') {
+      steps {
+        // Si NO es multibranch, usa: git branch: 'main', url: 'https://github.com/alexisjimoba/pythonApp.git'
+        checkout scm
+        ansiColor('xterm') {
+          sh '''#!/bin/bash
+            set -euxo pipefail
+            echo "== Entorno ==" && printenv | sort
+            git --version
+            python3 --version
+            pip3 --version
+          '''
+        }
+      }
+    }
+
+    stage('Setup Tooling (tfsec / terraform / checkov)') {
       steps {
         ansiColor('xterm') {
           sh '''#!/bin/bash
             set -euxo pipefail
             mkdir -p "${LOCAL_BIN}"
 
-            # --- tfsec (amd64/arm64) ---
+            # tfsec (amd64/arm64) sin sudo
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
               TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
@@ -80,18 +76,16 @@ pipeline {
             chmod +x "${LOCAL_BIN}/tfsec"
             tfsec --version
 
-            # --- Terraform (sin sudo) ---
+            # Terraform CLI sin sudo
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o "$TF_ZIP"
             unzip -o "$TF_ZIP" -d "${LOCAL_BIN}"
             rm -f "$TF_ZIP"
             terraform -version
 
-            # --- venv + checkov ---
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install --upgrade pip
-            pip install checkov
+            # checkov sin venv (para simplificar)
+            pip3 install --no-cache-dir --upgrade pip
+            pip3 install --no-cache-dir checkov
             checkov --version
           '''
         }
@@ -105,7 +99,7 @@ pipeline {
             set -euxo pipefail
             mkdir -p reports
 
-            # Autodetección de carpeta con .tf
+            # Detecta carpeta con .tf
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
@@ -121,7 +115,6 @@ pipeline {
             echo "🔎 Escaneando Terraform en: ${TARGET}"
             tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}"
             tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}"
-            source .venv/bin/activate
             checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif
             checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml
           '''
@@ -135,7 +128,7 @@ pipeline {
             try {
               recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
             } catch (err) {
-              echo "recordIssues/SARIF no disponible (Warnings NG no instalado?): ${err}"
+              echo "recordIssues/SARIF no disponible (¿Warnings NG no instalado?): ${err}"
             }
           }
         }
@@ -149,7 +142,7 @@ pipeline {
           sh '''#!/bin/bash
             set -euxo pipefail
 
-            # Selección de carpeta
+            # Selección de carpeta Terraform
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
@@ -160,7 +153,7 @@ pipeline {
               fi
             fi
 
-            # tfvars del ambiente (si existe)
+            # tfvars del ambiente si existe
             TFVARS=""
             if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
               TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
@@ -170,24 +163,19 @@ pipeline {
             echo "🌱 Ambiente: ${TF_ENV}"
             echo "⚙️  Acción: ${TF_ACTION}"
 
-            # Init / Validate
             terraform -chdir="${TARGET}" init -input=false -upgrade
             terraform -chdir="${TARGET}" validate
 
-            # Si no hay credenciales AWS, avisa temprano (para evitar errores poco claros)
+            # Aviso si no hay credenciales AWS
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "⚠️  AWS creds no presentes en el entorno. Si el provider AWS requiere acceso, plan/apply fallarán."
+              echo "⚠️  AWS creds no presentes: plan/apply podrían fallar si el provider las requiere."
             fi
 
-            # Plan
             if [ "${TF_ACTION}" = "plan" ] || [ "${TF_ACTION}" = "apply" ]; then
               terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
             fi
 
-            # Apply (protegido por TF_ACTION)
-            if [ "${TF_ACTION}" = "apply" ]; then
-              # Puedes pedir confirmación manual con 'input' si quieres:
-              # echo "Esperando confirmación para aplicar..." ; sleep 10
+            if [ "${TF_ACTION}" = "apply" ] ; then
               terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
             fi
           '''
@@ -197,7 +185,7 @@ pipeline {
   }
 
   post {
-    success { echo "✅ Pipeline OK (incluye Terraform ${params.TF_ACTION})." }
+    success { echo "✅ Pipeline OK (Terraform: ${params.TF_ACTION})." }
     always  { echo "📦 Reportes en 'reports/' (si hubo análisis)." }
   }
 }
