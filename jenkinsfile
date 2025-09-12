@@ -11,15 +11,14 @@ pipeline {
     choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
     string(name: 'API_SERVER_HOST', defaultValue: '192.168.49.2', description: 'IP del API server (minikube ip)')
     string(name: 'API_SERVER_PORT', defaultValue: '8443', description: 'Puerto del API server')
+    string(name: 'KUBE_CRED_ID',    defaultValue: 'kubeconfig-minikube', description: 'ID de credencial Secret file con el kubeconfig')
   }
 
   environment {
     LOCAL_BIN     = "${WORKSPACE}/.bin"
     PATH          = "${WORKSPACE}/.bin:${PATH}"
-
     TF_WORKDIR    = 'terraform'
     TF_VERSION    = '1.6.6'
-
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
   }
@@ -51,7 +50,6 @@ pipeline {
             set -euxo pipefail
             mkdir -p "${LOCAL_BIN}"
 
-            # helper descarga (curl o wget)
             dl() { URL="$1"; OUT="$2";
               if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
               elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
@@ -112,7 +110,6 @@ pipeline {
               else TARGET="."; fi
             fi
 
-            # validate temprano (si hay Terraform)
             if command -v terraform >/dev/null 2>&1; then
               terraform -chdir="${TARGET}" init -backend=false -upgrade || true
               terraform -chdir="${TARGET}" validate || true
@@ -136,7 +133,7 @@ pipeline {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          echo "ℹ️ Para visualizar SARIF en Jenkins, instala 'Warnings Next Generation' y agrega recordIssues + sarif()."
+          echo "ℹ️ Instala 'Warnings Next Generation' si quieres visualizar SARIF."
         }
       }
     }
@@ -145,7 +142,10 @@ pipeline {
       when { expression { params.TF_ACTION != 'none' } }
       steps {
         script {
-          withCredentials([file(credentialsId: 'kubeconfig-minikube', variable: 'KCF')]) {
+          if (!params.KUBE_CRED_ID?.trim()) {
+            error "Configura el parámetro KUBE_CRED_ID con el ID de la credencial (Secret file) que contiene tu kubeconfig."
+          }
+          withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF')]) {
             def cmd = '''#!/bin/bash
               set -euxo pipefail
 
@@ -159,14 +159,9 @@ pipeline {
                 sed -E "s#(^\\s*server:\\s*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
               fi
 
-              # Export para kubectl (si estuviera instalado) – verificación opcional
               export KUBECONFIG="${TF_VAR_kubeconfig_path}"
               export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
-              if command -v kubectl >/dev/null 2>&1; then
-                kubectl --request-timeout=5s get ns || true
-              fi
 
-              # Selección de carpeta Terraform
               TARGET="${TF_WORKDIR}"
               if [ ! -d "${TARGET}" ]; then
                 if   [ -d "terraform" ];       then TARGET="terraform"
@@ -192,7 +187,7 @@ pipeline {
                 terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
               fi
 
-              # Exporta plan en JSON (útil para artefacto/PR)
+              mkdir -p "${WORKSPACE}/reports"
               terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
             '''
             try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
