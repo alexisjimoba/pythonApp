@@ -7,190 +7,166 @@ pipeline {
   }
 
   parameters {
-    choice(name: 'TF_ACTION', choices: ['init','plan','apply','destroy','none'], description: 'Acción de Terraform')
-    choice(name: 'TF_ENV',    choices: ['staging','production','local'], description: 'Ambiente para tfvars')
+    choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
+    choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
 
-    // API server accesible desde el contenedor (Windows: host.docker.internal)
-    string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal', description: 'Host del API server')
-    string(name: 'API_SERVER_PORT', defaultValue: '49230', description: 'Puerto del API server')
+    // 👉 Windows + Docker Desktop: apunta al host de Windows visto desde el contenedor
+    string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal',
+           description: 'Host del API server (Windows: host.docker.internal)')
+    // Usa el puerto real de tu kubeconfig (ej. 49230). Si cambia, actualízalo al lanzar el build.
+    string(name: 'API_SERVER_PORT', defaultValue: '49230',
+           description: 'Puerto del API server (desde kubeconfig del host)')
 
-    // Registry local
-    string(name: 'REGISTRY_PUSH', defaultValue: 'localhost:5000', description: 'Registro para hacer push')
-    string(name: 'REGISTRY_PULL', defaultValue: 'host.minikube.internal:5000', description: 'Registro que usarán los Pods')
-    string(name: 'REPOSITORY',    defaultValue: 'pythonapp', description: 'Nombre del repo en el registry local (namespace/name o solo name)')
-
-    // Credenciales (opcionales). Si dejas vacío, no hace docker login.
-    string(name: 'DOCKER_CRED_ID', defaultValue: '', description: 'ID credencial para docker login (opcional)')
-
-    // kubeconfig (credencial opcional o ruta montada en el contenedor)
-    string(name: 'KUBE_CRED_ID',     defaultValue: '', description: 'ID credencial Secret file/text con kubeconfig (opcional)')
-    string(name: 'KUBE_CONFIG_PATH', defaultValue: '/kubeconfig', description: 'Ruta kubeconfig en el agente (fallback)')
+    // Credencial opcional con kubeconfig (Secret file o Secret text). Si la dejas vacía, usa KUBE_CONFIG_PATH
+    string(name: 'KUBE_CRED_ID',     defaultValue: '',            description: 'ID credencial (Secret file o Secret text) con kubeconfig')
+    // Ruta del kubeconfig dentro del agente. Útil si montas el archivo: -v C:\\Users\\tuUsuario\\kubeconfig-minikube:/kubeconfig:ro
+    string(name: 'KUBE_CONFIG_PATH', defaultValue: '/kubeconfig', description: 'Ruta kubeconfig en el agente (fallback si no hay credencial)')
   }
 
   environment {
-    LOCAL_BIN       = "${WORKSPACE}/.bin"
-    PATH            = "${WORKSPACE}/.bin:${PATH}"
-    TF_WORKDIR      = 'terraform'
-    TF_VERSION      = '1.6.6'
+    LOCAL_BIN     = "${WORKSPACE}/.bin"
+    PATH          = "${WORKSPACE}/.bin:${PATH}"
+    TF_WORKDIR    = 'terraform'
+    TF_VERSION    = '1.6.6'
 
-    // Vars Terraform comunes (ajústalas si las usas)
-    TF_VAR_env      = 'dev'
-    TF_VAR_region   = 'us-central1'
-
-    // kubeconfig destino dentro del workspace
-    KUBECONFIG_PATH = "${WORKSPACE}/.kube/config"
+    TF_VAR_env    = 'dev'
+    TF_VAR_region = 'us-central1'
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout scm
-        sh 'git --version || true'
-      }
-    }
-
-    stage('Docker Preflight') {
-      steps {
-        sh '''
-          set -eu
-          command -v docker
-          docker version
-          echo "OK: docker CLI y socket disponibles."
-        '''
-      }
-    }
-
-    stage('Build & Push to Local Registry') {
-      steps {
         script {
-          def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD || echo latest').trim()
-          env.IMAGE_TAG           = sha
-          env.IMAGE_LOCAL         = "pythonapp:${IMAGE_TAG}"
-          env.IMAGE_LOCALHOST     = "${params.REGISTRY_PUSH}/${params.REPOSITORY}:${IMAGE_TAG}"
-          env.IMAGE_MINIKUBEHOST  = "${params.REGISTRY_PULL}/${params.REPOSITORY}:${IMAGE_TAG}"
+          def cmd = '''#!/bin/sh
+            set -eu
+            echo "== Entorno ==" && printenv | sort
+            which git  || true; git  --version  || true
+            which curl || true
+            which wget || true
+            which jar  || true
+            which python3 || true
+          '''
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
-
-        // login opcional si hay credenciales
-        script {
-          if (params.DOCKER_CRED_ID?.trim()) {
-            withCredentials([usernamePassword(credentialsId: params.DOCKER_CRED_ID, usernameVariable: 'DO_USER', passwordVariable: 'DO_PASS')]) {
-              sh '''
-                set -eu
-                echo "$DO_PASS" | docker login "${REGISTRY_PUSH}" -u "$DO_USER" --password-stdin || true
-                echo "$DO_PASS" | docker login "${REGISTRY_PULL}" -u "$DO_USER" --password-stdin || true
-              '''
-            }
-          }
-        }
-
-        sh '''
-          set -eu
-          echo "🔨 Build ${IMAGE_LOCAL}..."
-          docker build -t "${IMAGE_LOCAL}" application
-
-          echo "🏷️  Tagging..."
-          docker tag "${IMAGE_LOCAL}" "${IMAGE_LOCALHOST}"
-          docker tag "${IMAGE_LOCAL}" "${IMAGE_MINIKUBEHOST}"
-
-          echo "📤 Push..."
-          docker push "${IMAGE_LOCALHOST}"
-          docker push "${IMAGE_MINIKUBEHOST}"
-        '''
       }
     }
 
     stage('Setup Tooling (sin apt)') {
       steps {
-        sh '''
-          set -eu
-          mkdir -p "${LOCAL_BIN}"
+        script {
+          def cmd = '''#!/bin/sh
+            set -eu
+            mkdir -p "${LOCAL_BIN}"
 
-          dl() { URL="$1"; OUT="$2";
-            if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
-            elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
-            else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi; }
+            echo "PATH=${PATH}"
+            which curl || true
+            which wget || true
+            which jar  || true
+            which python3 || true
 
-          ARCH=$(uname -m)
-          if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-            TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
-            TERRAFORM_ARCH="amd64"
-            CKV_ZIP="checkov_linux_X86_64.zip"
-          else
-            TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
-            TERRAFORM_ARCH="arm64"
-            CKV_ZIP="checkov_linux_arm64.zip"
-          fi
+            dl() {
+              URL="$1"; OUT="$2"
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT"
+              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL"
+              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi
+            }
 
-          # tfsec
-          ( dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" && "${LOCAL_BIN}/tfsec" --version ) || echo "⚠️ tfsec no disponible"
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
+              TERRAFORM_ARCH="amd64"
+              CKV_ZIP="checkov_linux_X86_64.zip"
+            else
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
+              TERRAFORM_ARCH="arm64"
+              CKV_ZIP="checkov_linux_arm64.zip"
+            fi
 
-          # Terraform (zip) con 'jar'
-          TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
-          if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
-            rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
-            mv .tfzip/terraform "${LOCAL_BIN}/terraform" || true
-            rm -rf .tfzip "$TF_ZIP"
-            chmod +x "${LOCAL_BIN}/terraform" || true
-            "${LOCAL_BIN}/terraform" -version || true
-          else
-            echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
-          fi
+            # --- tfsec ---
+            ( dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" && "${LOCAL_BIN}/tfsec" --version ) || {
+              echo "⚠️ tfsec no disponible"
+            }
 
-          # Checkov (best-effort)
-          if command -v python3 >/dev/null 2>&1; then
-            python3 -m pip install --no-cache-dir --upgrade pip || true
-            python3 -m pip install --no-cache-dir --user checkov || true
-            export PATH="${HOME}/.local/bin:${PATH}"
-          fi
-          if ! command -v checkov >/dev/null 2>&1; then
-            if command -v jar >/dev/null 2>&1; then
-              if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
-                rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
-                CKV_BIN="$(find .ckvzip -type f -name checkov | head -n 1 || true)"
-                [ -n "${CKV_BIN}" ] && mv "${CKV_BIN}" "${LOCAL_BIN}/checkov" && chmod +x "${LOCAL_BIN}/checkov" || true
-                rm -rf .ckvzip "$CKV_ZIP"
+            # --- Terraform (zip) → extraer con 'jar' (sin unzip) ---
+            TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
+            if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
+              rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
+              mv .tfzip/terraform "${LOCAL_BIN}/terraform" || true
+              rm -rf .tfzip "$TF_ZIP"
+              chmod +x "${LOCAL_BIN}/terraform" || true
+              "${LOCAL_BIN}/terraform" -version || true
+            else
+              echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
+            fi
+
+            # --- Checkov (opcional) ---
+            if command -v python3 >/dev/null 2>&1; then
+              python3 -m pip install --no-cache-dir --upgrade pip || true
+              python3 -m pip install --no-cache-dir --user checkov || true
+              export PATH="${HOME}/.local/bin:${PATH}"
+            fi
+            if ! command -v checkov >/dev/null 2>&1; then
+              echo "ℹ️ Intentando Checkov como binario (sin Python)"
+              if command -v jar >/dev/null 2>&1; then
+                if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
+                  rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
+                  CKV_BIN="$(find .ckvzip -type f -name checkov | head -n 1 || true)"
+                  [ -n "${CKV_BIN}" ] && mv "${CKV_BIN}" "${LOCAL_BIN}/checkov" && chmod +x "${LOCAL_BIN}/checkov" || true
+                  rm -rf .ckvzip "$CKV_ZIP"
+                fi
               fi
             fi
-          fi
-          if [ -x "${LOCAL_BIN}/checkov" ]; then
-            "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || { echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
-          fi
-        '''
+            if [ -x "${LOCAL_BIN}/checkov" ]; then
+              "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || {
+                echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
+            fi
+
+            echo "== Binarios instalados =="; ls -l "${LOCAL_BIN}" || true
+            command -v checkov >/dev/null 2>&1 && checkov --version || echo "ℹ️ checkov no disponible"
+          '''
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+        }
       }
     }
 
     stage('Static Code Analysis: Terraform') {
       steps {
-        sh '''
-          set -eu
-          mkdir -p reports
-          TARGET="${TF_WORKDIR}"
-          if [ ! -d "${TARGET}" ]; then
-            if   [ -d "terraform" ];       then TARGET="terraform";
-            elif [ -d "infra/terraform" ]; then TARGET="infra/terraform";
-            else TARGET="."; fi
-          fi
+        script {
+          def cmd = '''#!/bin/sh
+            set -eu
+            mkdir -p reports
 
-          if command -v terraform >/dev/null 2>&1; then
-            terraform -chdir="${TARGET}" init -backend=false -upgrade || true
-            terraform -chdir="${TARGET}" validate || true
-          fi
+            TARGET="${TF_WORKDIR}"
+            if [ ! -d "${TARGET}" ]; then
+              if   [ -d "terraform" ];       then TARGET="terraform"
+              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+              else TARGET="."; fi
+            fi
 
-          if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
-            echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
-            exit 0
-          fi
+            if command -v terraform >/dev/null 2>&1; then
+              terraform -chdir="${TARGET}" init -backend=false -upgrade || true
+              terraform -chdir="${TARGET}" validate || true
+            fi
 
-          echo "🔎 Escaneando Terraform en: ${TARGET}"
-          command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}" || true
-          command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}" || true
-          if command -v checkov >/dev/null 2>&1; then
-            checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
-            checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
-          else
-            echo "ℹ️ Checkov no disponible en este entorno; solo se ejecutó tfsec."
-          fi
-        '''
+            if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
+              echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
+              exit 0
+            fi
+
+            echo "🔎 Escaneando Terraform en: ${TARGET}"
+            command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}" || true
+            command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}" || true
+            if command -v checkov >/dev/null 2>&1; then
+              checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
+              checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
+            else
+              echo "ℹ️ Checkov no disponible en este entorno; solo se ejecutó tfsec."
+            fi
+          '''
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+        }
       }
       post {
         always {
@@ -200,98 +176,109 @@ pipeline {
       }
     }
 
-    stage('Prepare Kubeconfig (TLS best-effort)') {
+    stage('Terraform Init/Plan/Apply') {
+      when { expression { params.TF_ACTION != 'none' } }
       steps {
         script {
-          def prep = { String kubePath ->
+          // Helper para ejecutar Terraform con ruta de kubeconfig ya resuelta
+          def runWithKubeconfig = { String kubePath ->
             withEnv(["KC_PATH=${kubePath}"]) {
-              sh '''
+              def cmd = '''#!/bin/sh
                 set -eu
-                mkdir -p "$(dirname ${KUBECONFIG_PATH})"
-                cp "${KC_PATH}" "${KUBECONFIG_PATH}"
+                mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
+                export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
+                cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
-                # Forzar server alcanzable desde el contenedor
+                # ---- FORZAR server: al host/puerto alcanzables
                 API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
-                sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${KUBECONFIG_PATH}"
+                sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
-                # Desactivar validación TLS para evitar CN/SAN
-                sed -E -i '/^[[:space:]]*certificate-authority(-data)?:/d' "${KUBECONFIG_PATH}"
-                grep -q '^[[:space:]]*insecure-skip-tls-verify:' "${KUBECONFIG_PATH}" || \
-                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  insecure-skip-tls-verify: true' "${KUBECONFIG_PATH}"
+                # ---- TLS correcto (sin desactivar CA):
+                # 1) Elimina cualquier 'insecure-skip-tls-verify' previo
+                sed -E -i '/^[[:space:]]*insecure-skip-tls-verify:/d' "${TF_VAR_kubeconfig_path}"
+                # 2) Añade/actualiza SNI para que el cert del apiserver (incluye "localhost") valide bien
+                if grep -q '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}"; then
+                  sed -E -i 's#^([[:space:]]*tls-server-name:).*$#\\1 localhost#' "${TF_VAR_kubeconfig_path}"
+                else
+                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  tls-server-name: localhost' "${TF_VAR_kubeconfig_path}"
+                fi
 
-                export KUBECONFIG="${KUBECONFIG_PATH}"
-                curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null
+                # Preflight de conectividad (reachability, sin validar cert)
+                if command -v curl >/dev/null 2>&1; then
+                  curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null || {
+                    echo "❌ No hay conectividad al API server ${API_URL} desde el contenedor"; exit 1; }
+                fi
+
+                export KUBECONFIG="${TF_VAR_kubeconfig_path}"
+                export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
+                echo "🔗 Entradas kubeconfig:"
+                grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
+                grep -m1 '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}" || true
+
+                TARGET="${TF_WORKDIR}"
+                if [ ! -d "${TARGET}" ]; then
+                  if   [ -d "terraform" ];       then TARGET="terraform"
+                  elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+                  else echo "❌ No se encontró directorio Terraform."; exit 1; fi
+                fi
+
+                TFVARS=""
+                if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+                  TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+                fi
+
+                terraform -chdir="${TARGET}" init -input=false -upgrade
+                terraform -chdir="${TARGET}" validate
+                terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+
+                if [ "${TF_ACTION}" = "apply" ]; then
+                  terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+                fi
+
+                terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
               '''
+              try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
             }
           }
 
           boolean used = false
+
+          // 1) Intentar credencial como Secret file
           if (params.KUBE_CRED_ID?.trim()) {
             try {
               withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_FILE')]) {
-                prep(KCF_FILE); used = true
+                echo "Usando credencial como Secret file: ${params.KUBE_CRED_ID}"
+                runWithKubeconfig(KCF_FILE); used = true
               }
-            } catch (ignore) {}
-            if (!used) {
-              withCredentials([string(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_TEXT')]) {
-                def kcPath = "${WORKSPACE}/.kube/kubeconfig_from_secret_text"
-                writeFile file: kcPath, text: KCF_TEXT
-                prep(kcPath); used = true
-              }
+            } catch (e1) {
+              echo "No es Secret file (${params.KUBE_CRED_ID}): ${e1}"
             }
           }
-          if (!used) {
-            prep(params.KUBE_CONFIG_PATH)
+
+          // 2) Intentar credencial como Secret text
+          if (!used && params.KUBE_CRED_ID?.trim()) {
+            try {
+              withCredentials([string(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_TEXT')]) {
+                echo "Usando credencial como Secret text: ${params.KUBE_CRED_ID}"
+                def kcPath = "${WORKSPACE}/.kube/kubeconfig_from_secret_text"
+                writeFile file: kcPath, text: KCF_TEXT
+                runWithKubeconfig(kcPath); used = true
+              }
+            } catch (e2) {
+              echo "Tampoco es Secret text (${params.KUBE_CRED_ID}): ${e2}"
+            }
           }
-        }
-      }
-    }
 
-    stage('Terraform (init/plan/apply/destroy)') {
-      when { expression { params.TF_ACTION != 'none' } }
-      steps {
-        script {
-          // Pasar repo/tag reales a Terraform → Helm usará esta imagen
-          env.TF_VAR_image_repository = "${params.REGISTRY_PULL}/${params.REPOSITORY}"
-          env.TF_VAR_image_tag        = env.IMAGE_TAG
-        }
-        dir("${TF_WORKDIR}") {
-          sh '''
-            set -eu
-            if ! command -v terraform >/dev/null 2>&1; then
-              echo "❌ Terraform CLI no disponible."; exit 1; fi
-
-            TARGET="."
-            echo "📁 Dir: ${PWD} | ⚙️ Acción: ${TF_ACTION}"
-
-            terraform -chdir="${TARGET}" init -input=false -upgrade
-
-            if [ "${TF_ACTION}" = "init" ]; then
-              echo "✅ Terraform init listo."
-              exit 0
-            fi
-
-            # tfvars por ambiente si existe
-            TFVARS=""
-            if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
-              TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
-            fi
-
-            if [ "${TF_ACTION}" = "destroy" ]; then
-              terraform -chdir="${TARGET}" destroy -input=false -auto-approve ${TFVARS}
-              exit 0
-            fi
-
-            terraform -chdir="${TARGET}" validate
-            terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
-
-            if [ "${TF_ACTION}" = "apply" ]; then
-              terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
-            fi
-
-            # Artefacto útil
-            terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
-          '''
+          // 3) Fallback por ruta
+          if (!used) {
+            if (params.KUBE_CONFIG_PATH?.trim()) {
+              echo "Usando KUBE_CONFIG_PATH=${params.KUBE_CONFIG_PATH}"
+              runWithKubeconfig(params.KUBE_CONFIG_PATH)
+            } else {
+              error "No hay credencial '${params.KUBE_CRED_ID}' y KUBE_CONFIG_PATH está vacío. " +
+                    "Monta el kubeconfig (-v ...:/kubeconfig) y pon KUBE_CONFIG_PATH=/kubeconfig, o crea la credencial."
+            }
+          }
         }
       }
       post {
@@ -303,7 +290,7 @@ pipeline {
   }
 
   post {
-    success { echo "✅ Pipeline OK (TF_ACTION=${params.TF_ACTION}). Imagen publicada y chart desplegado." }
+    success { echo "✅ Pipeline OK (Terraform: ${params.TF_ACTION})." }
     always  { echo "📦 Reportes en 'reports/' (si hubo análisis/plan)." }
   }
 }
