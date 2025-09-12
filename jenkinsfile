@@ -10,31 +10,61 @@ pipeline {
 
   parameters {
     choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción a ejecutar')
+
     // Imagen YA existente (no se construye aquí)
     string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repo de la imagen (registry/proj/pythonapp)')
     string(name: 'IMAGE_TAG',        defaultValue: 'latest',    description: 'Tag de la imagen')
 
-    // K8s / Helm
-    string(name: 'NAMESPACE',     defaultValue: 'pythonapp', description: 'Namespace destino')
-    string(name: 'RELEASE_NAME',  defaultValue: 'pythonapp', description: 'Nombre del release Helm')
+    // K8s / Helm (valores del chart)
+    string(name: 'NAMESPACE',     defaultValue: 'pythonapp', description: 'Namespace')
+    string(name: 'RELEASE_NAME',  defaultValue: 'pythonapp', description: 'Release Helm')
     string(name: 'REPLICAS',      defaultValue: '1',         description: 'Réplicas')
-    string(name: 'SERVICE_TYPE',  defaultValue: 'NodePort',  description: 'Service type (NodePort/ClusterIP)')
-    string(name: 'SERVICE_PORT',  defaultValue: '80',        description: 'Puerto del Service (externo)')
-    string(name: 'TARGET_PORT',   defaultValue: '8000',      description: 'Puerto del contenedor (app)')
-    string(name: 'NODE_PORT',     defaultValue: '30080',     description: 'NodePort (si SERVICE_TYPE=NodePort)')
+    string(name: 'SERVICE_TYPE',  defaultValue: 'NodePort',  description: 'NodePort/ClusterIP')
+    string(name: 'SERVICE_PORT',  defaultValue: '80',        description: 'Service port (externo)')
+    string(name: 'TARGET_PORT',   defaultValue: '8000',      description: 'Puerto del contenedor')
+    string(name: 'NODE_PORT',     defaultValue: '30080',     description: 'NodePort (si aplica)')
     booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
-    string(name: 'INGRESS_HOST',  defaultValue: 'pythonapp.local', description: 'Host del Ingress')
+    string(name: 'INGRESS_HOST',  defaultValue: 'pythonapp.local', description: 'Host Ingress')
+
+    // Versión de Terraform a instalar localmente
+    string(name: 'TERRAFORM_VERSION', defaultValue: '1.6.6', description: 'Versión de Terraform (linux amd64/arm64)')
   }
 
   stages {
 
-    stage('Preflight') {
+    stage('Preflight (básico)') {
       steps {
         sh '''
           set -e
-          for t in terraform helm git curl; do
+          for t in curl git jar; do
             command -v $t >/dev/null || { echo "Falta $t en el agente Jenkins: $t"; exit 1; }
           done
+        '''
+      }
+    }
+
+    stage('Setup Terraform (local, sin root)') {
+      steps {
+        sh '''
+          set -e
+          mkdir -p .bin
+          if ! [ -x .bin/terraform ]; then
+            VER="${TERRAFORM_VERSION}"
+            OS="linux"
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64|amd64) ARCH="amd64" ;;
+              aarch64|arm64) ARCH="arm64" ;;
+              *) ARCH="amd64" ;;
+            esac
+            URL="https://releases.hashicorp.com/terraform/${VER}/terraform_${VER}_${OS}_${ARCH}.zip"
+            echo "Descargando Terraform ${VER} (${ARCH}) ..."
+            curl -fsSL -o tf.zip "$URL"
+            (cd .bin && jar -xf ../tf.zip)   # jar extrae ZIP (viene con JDK)
+            rm -f tf.zip
+            chmod +x .bin/terraform
+          fi
+          .bin/terraform version
         '''
       }
     }
@@ -47,37 +77,39 @@ pipeline {
     stage('Terraform Init & Plan (deploy)') {
       when { expression { params.ACTION == 'deploy' } }
       steps {
-        withCredentials([
-          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
-          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
-          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
-          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
-        ]) {
-          withEnv([
-            "TF_VAR_namespace=${params.NAMESPACE}",
-            "TF_VAR_release_name=${params.RELEASE_NAME}",
-            "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
-            "TF_VAR_image_tag=${params.IMAGE_TAG}",
-            "TF_VAR_replicas=${params.REPLICAS}",
-            "TF_VAR_service_type=${params.SERVICE_TYPE}",
-            "TF_VAR_service_port=${params.SERVICE_PORT}",
-            "TF_VAR_service_target_port=${params.TARGET_PORT}",
-            "TF_VAR_node_port=${params.NODE_PORT}",
-            "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
-            "TF_VAR_ingress_host=${params.INGRESS_HOST}"
+        withEnv(["PATH+TF=${env.WORKSPACE}/.bin"]) {
+          withCredentials([
+            string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+            string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+            string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+            string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
           ]) {
-            sh '''
-              set -e
-              unset KUBECONFIG
-              cd terraform
-              terraform init -upgrade
-              terraform fmt -check -recursive || true
-              terraform validate
-              terraform plan -input=false -no-color -out=tfplan.bin | tee tfplan.txt
-              echo "---- Resumen del plan ----"
-              grep -E "^Plan: " tfplan.txt || true
-            '''
-            archiveArtifacts artifacts: 'terraform/tfplan.bin, terraform/tfplan.txt', onlyIfSuccessful: true
+            withEnv([
+              "TF_VAR_namespace=${params.NAMESPACE}",
+              "TF_VAR_release_name=${params.RELEASE_NAME}",
+              "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
+              "TF_VAR_image_tag=${params.IMAGE_TAG}",
+              "TF_VAR_replicas=${params.REPLICAS}",
+              "TF_VAR_service_type=${params.SERVICE_TYPE}",
+              "TF_VAR_service_port=${params.SERVICE_PORT}",
+              "TF_VAR_service_target_port=${params.TARGET_PORT}",
+              "TF_VAR_node_port=${params.NODE_PORT}",
+              "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
+              "TF_VAR_ingress_host=${params.INGRESS_HOST}"
+            ]) {
+              sh '''
+                set -e
+                unset KUBECONFIG
+                cd terraform
+                terraform init -upgrade
+                terraform fmt -check -recursive || true
+                terraform validate
+                terraform plan -input=false -no-color -out=tfplan.bin | tee tfplan.txt
+                echo "---- Resumen del plan ----"
+                grep -E "^Plan: " tfplan.txt || true
+              '''
+              archiveArtifacts artifacts: 'terraform/tfplan.bin, terraform/tfplan.txt', onlyIfSuccessful: true
+            }
           }
         }
       }
@@ -87,24 +119,12 @@ pipeline {
     stage('Terraform Apply (deploy)') {
       when { expression { params.ACTION == 'deploy' } }
       steps {
-        withCredentials([
-          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
-          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
-          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
-          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
-        ]) {
-          withEnv([
-            "TF_VAR_namespace=${params.NAMESPACE}",
-            "TF_VAR_release_name=${params.RELEASE_NAME}",
-            "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
-            "TF_VAR_image_tag=${params.IMAGE_TAG}",
-            "TF_VAR_replicas=${params.REPLICAS}",
-            "TF_VAR_service_type=${params.SERVICE_TYPE}",
-            "TF_VAR_service_port=${params.SERVICE_PORT}",
-            "TF_VAR_service_target_port=${params.TARGET_PORT}",
-            "TF_VAR_node_port=${params.NODE_PORT}",
-            "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
-            "TF_VAR_ingress_host=${params.INGRESS_HOST}"
+        withEnv(["PATH+TF=${env.WORKSPACE}/.bin"]) {
+          withCredentials([
+            string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+            string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+            string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+            string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
           ]) {
             sh '''
               set -e
@@ -122,26 +142,28 @@ pipeline {
     stage('Terraform Init & Plan (destroy)') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
-        withCredentials([
-          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
-          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
-          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
-          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
-        ]) {
-          withEnv([
-            "TF_VAR_namespace=${params.NAMESPACE}",
-            "TF_VAR_release_name=${params.RELEASE_NAME}"
+        withEnv(["PATH+TF=${env.WORKSPACE}/.bin"]) {
+          withCredentials([
+            string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+            string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+            string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+            string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
           ]) {
-            sh '''
-              set -e
-              unset KUBECONFIG
-              cd terraform
-              terraform init -upgrade
-              terraform plan -destroy -input=false -no-color -out=tfplan-destroy.bin | tee tfplan-destroy.txt
-              echo "---- Resumen del plan destroy ----"
-              grep -E "^Plan: " tfplan-destroy.txt || true
-            '''
-            archiveArtifacts artifacts: 'terraform/tfplan-destroy.bin, terraform/tfplan-destroy.txt', onlyIfSuccessful: true
+            withEnv([
+              "TF_VAR_namespace=${params.NAMESPACE}",
+              "TF_VAR_release_name=${params.RELEASE_NAME}"
+            ]) {
+              sh '''
+                set -e
+                unset KUBECONFIG
+                cd terraform
+                terraform init -upgrade
+                terraform plan -destroy -input=false -no-color -out=tfplan-destroy.bin | tee tfplan-destroy.txt
+                echo "---- Resumen del plan destroy ----"
+                grep -E "^Plan: " tfplan-destroy.txt || true
+              '''
+              archiveArtifacts artifacts: 'terraform/tfplan-destroy.bin, terraform/tfplan-destroy.txt', onlyIfSuccessful: true
+            }
           }
         }
       }
@@ -151,19 +173,21 @@ pipeline {
     stage('Terraform Apply (destroy)') {
       when { expression { params.ACTION == 'destroy' } }
       steps {
-        withCredentials([
-          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
-          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
-          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
-          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
-        ]) {
-          sh '''
-            set -e
-            unset KUBECONFIG
-            cd terraform
-            test -f tfplan-destroy.bin || { echo "No existe tfplan-destroy.bin. Ejecuta primero el stage de Plan destroy."; exit 1; }
-            terraform apply -input=false -no-color tfplan-destroy.bin
-          '''
+        withEnv(["PATH+TF=${env.WORKSPACE}/.bin"]) {
+          withCredentials([
+            string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+            string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+            string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+            string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
+          ]) {
+            sh '''
+              set -e
+              unset KUBECONFIG
+              cd terraform
+              test -f tfplan-destroy.bin || { echo "No existe tfplan-destroy.bin. Ejecuta primero el stage de Plan destroy."; exit 1; }
+              terraform apply -input=false -no-color tfplan-destroy.bin
+            '''
+          }
         }
       }
     }
