@@ -9,9 +9,10 @@ pipeline {
   parameters {
     choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
     choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
-    string(name: 'API_SERVER_HOST', defaultValue: '192.168.49.2', description: 'IP del API server (minikube ip)')
-    string(name: 'API_SERVER_PORT', defaultValue: '8443', description: 'Puerto del API server')
-    string(name: 'KUBE_CRED_ID',    defaultValue: 'kubeconfig-minikube', description: 'ID de credencial Secret file con el kubeconfig')
+    string(name: 'API_SERVER_HOST',  defaultValue: '192.168.49.2', description: 'IP del API server (minikube ip)')
+    string(name: 'API_SERVER_PORT',  defaultValue: '8443',         description: 'Puerto del API server')
+    string(name: 'KUBE_CRED_ID',     defaultValue: 'kubeconfig-minikube', description: 'ID credencial Secret file con kubeconfig (déjalo vacío para usar KUBE_CONFIG_PATH)')
+    string(name: 'KUBE_CONFIG_PATH', defaultValue: '', description: 'Ruta kubeconfig en el agente (fallback si no hay credencial)')
   }
 
   environment {
@@ -19,6 +20,7 @@ pipeline {
     PATH          = "${WORKSPACE}/.bin:${PATH}"
     TF_WORKDIR    = 'terraform'
     TF_VERSION    = '1.6.6'
+
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
   }
@@ -138,75 +140,75 @@ pipeline {
       }
     }
 
-stage('Terraform Init/Plan/Apply') {
-  when { expression { params.TF_ACTION != 'none' } }
-  steps {
-    script {
-      // Función que ejecuta la lógica con una ruta de kubeconfig ya resuelta
-      def runWithKubeconfig = { String kubePath ->
-        def cmd = '''#!/bin/bash
-          set -euxo pipefail
+    stage('Terraform Init/Plan/Apply') {
+      when { expression { params.TF_ACTION != 'none' } }
+      steps {
+        script {
+          // Función que ejecuta Terraform con una ruta de kubeconfig ya resuelta
+          def runWithKubeconfig = { String kubePath ->
+            def cmd = '''#!/bin/bash
+              set -euxo pipefail
 
-          mkdir -p "${WORKSPACE}/.kube"
-          export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
-          cp '"'''+kubePath+'''"'" "${TF_VAR_kubeconfig_path}"
+              mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
+              export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
+              cp '"'''+kubePath+'''"'" "${TF_VAR_kubeconfig_path}"
 
-          # Si el kubeconfig apunta a 127.0.0.1, reescribe al host/puerto parametrizados
-          if grep -qE '^\\s*server:\\s*https?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}"; then
-            sed -E "s#(^\\s*server:\\s*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
-          fi
+              # Reescribe 127.0.0.1 -> host/puerto parametrizados si aplica
+              if grep -qE '^\\s*server:\\s*https?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}"; then
+                sed -E "s#(^\\s*server:\\s*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
+              fi
 
-          export KUBECONFIG="${TF_VAR_kubeconfig_path}"
-          export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
+              export KUBECONFIG="${TF_VAR_kubeconfig_path}"
+              export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
 
-          echo "🔗 API server en kubeconfig: $(grep -m1 '^\\s*server:' "${TF_VAR_kubeconfig_path}")"
+              echo "🔗 API server en kubeconfig: $(grep -m1 '^\\s*server:' "${TF_VAR_kubeconfig_path}")"
 
-          TARGET="${TF_WORKDIR}"
-          if [ ! -d "${TARGET}" ]; then
-            if   [ -d "terraform" ];       then TARGET="terraform"
-            elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-            else echo "❌ No se encontró directorio Terraform."; exit 1; fi
-          fi
+              TARGET="${TF_WORKDIR}"
+              if [ ! -d "${TARGET}" ]; then
+                if   [ -d "terraform" ];       then TARGET="terraform"
+                elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+                else echo "❌ No se encontró directorio Terraform."; exit 1; fi
+              fi
 
-          TFVARS=""
-          if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
-            TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
-          fi
+              TFVARS=""
+              if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+                TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+              fi
 
-          terraform -chdir="${TARGET}" init -input=false -upgrade
-          terraform -chdir="${TARGET}" validate
-          terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+              terraform -chdir="${TARGET}" init -input=false -upgrade
+              terraform -chdir="${TARGET}" validate
+              terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
 
-          if [ "${TF_ACTION}" = "apply" ]; then
-            terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
-          fi
+              if [ "${TF_ACTION}" = "apply" ]; then
+                terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+              fi
 
-          mkdir -p "${WORKSPACE}/reports"
-          terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
-        '''
-        try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
-      }
+              terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
+            '''
+            try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+          }
 
-      if (params.KUBE_CRED_ID?.trim()) {
-        // Ruta vía credencial Secret file (recomendado)
-        withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF')]) {
-          runWithKubeconfig(KCF)
+          if (params.KUBE_CRED_ID?.trim()) {
+            // Ruta vía credencial Secret file (recomendado)
+            withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF')]) {
+              runWithKubeconfig(KCF)
+            }
+          } else if (params.KUBE_CONFIG_PATH?.trim()) {
+            // Fallback: ruta directa en el agente
+            runWithKubeconfig(params.KUBE_CONFIG_PATH)
+          } else {
+            error "No se encontró credencial con ID '${params.KUBE_CRED_ID}' y no se proporcionó KUBE_CONFIG_PATH. " +
+                  "Crea la credencial Secret file con tu kubeconfig o pasa una ruta válida en KUBE_CONFIG_PATH."
+          }
         }
-      } else if (params.KUBE_CONFIG_PATH?.trim()) {
-        // Fallback: ruta directa en el agente
-        runWithKubeconfig(params.KUBE_CONFIG_PATH)
-      } else {
-        error "No se encontró credencial con ID '${params.KUBE_CRED_ID}' y no se proporcionó KUBE_CONFIG_PATH. \n" +
-              "Solución: crea la credencial Secret file con tu kubeconfig o pasa una ruta válida en KUBE_CONFIG_PATH."
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
+        }
       }
     }
   }
-  post {
-    always {
-      archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
-    }
-  }
-}
 
   post {
     success { echo "✅ Pipeline OK (Terraform: ${params.TF_ACTION})." }
