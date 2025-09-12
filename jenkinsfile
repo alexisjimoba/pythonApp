@@ -9,13 +9,17 @@ pipeline {
   parameters {
     choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
     choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
+    string(name: 'API_SERVER_HOST', defaultValue: '192.168.49.2', description: 'IP del API server (minikube ip)')
+    string(name: 'API_SERVER_PORT', defaultValue: '8443', description: 'Puerto del API server')
   }
 
   environment {
     LOCAL_BIN     = "${WORKSPACE}/.bin"
     PATH          = "${WORKSPACE}/.bin:${PATH}"
+
     TF_WORKDIR    = 'terraform'
     TF_VERSION    = '1.6.6'
+
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
   }
@@ -47,6 +51,7 @@ pipeline {
             set -euxo pipefail
             mkdir -p "${LOCAL_BIN}"
 
+            # helper descarga (curl o wget)
             dl() { URL="$1"; OUT="$2";
               if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
               elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
@@ -67,7 +72,7 @@ pipeline {
             dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" || true
             tfsec --version || echo "⚠️ tfsec no disponible"
 
-            # Terraform (extraer con 'jar')
+            # terraform (zip) → extraer con 'jar'
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
               rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
@@ -131,8 +136,7 @@ pipeline {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          // Nota: para ver SARIF en UI instala "Warnings Next Generation" (warnings-ng)
-          echo "ℹ️ Para ver SARIF en Jenkins, instala el plugin 'Warnings Next Generation' y usa recordIssues + sarif()."
+          echo "ℹ️ Para visualizar SARIF en Jenkins, instala 'Warnings Next Generation' y agrega recordIssues + sarif()."
         }
       }
     }
@@ -141,46 +145,63 @@ pipeline {
       when { expression { params.TF_ACTION != 'none' } }
       steps {
         script {
-          def cmd = '''#!/bin/bash
-            set -euxo pipefail
+          withCredentials([file(credentialsId: 'kubeconfig-minikube', variable: 'KCF')]) {
+            def cmd = '''#!/bin/bash
+              set -euxo pipefail
 
-            if ! command -v terraform >/dev/null 2>&1; then
-              echo "❌ Terraform CLI no disponible. Aborta stage."
-              exit 1
-            fi
+              # Copia de kubeconfig (credencial) y forzado de host/puerto del API
+              mkdir -p "${WORKSPACE}/.kube"
+              export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
+              cp "${KCF}" "${TF_VAR_kubeconfig_path}"
 
-            TARGET="${TF_WORKDIR}"
-            if [ ! -d "${TARGET}" ]; then
-              if   [ -d "terraform" ];       then TARGET="terraform"
-              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-              else echo "❌ No se encontró directorio Terraform."; exit 1; fi
-            fi
+              # Si el kubeconfig apunta a 127.0.0.1, reescribe al host/puerto de parámetros
+              if grep -qE '^\\s*server:\\s*https?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}"; then
+                sed -E "s#(^\\s*server:\\s*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
+              fi
 
-            TFVARS=""
-            if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
-              TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
-            fi
+              # Export para kubectl (si estuviera instalado) – verificación opcional
+              export KUBECONFIG="${TF_VAR_kubeconfig_path}"
+              export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
+              if command -v kubectl >/dev/null 2>&1; then
+                kubectl --request-timeout=5s get ns || true
+              fi
 
-            echo "📁 Directorio: ${TARGET}"
-            echo "🌱 Ambiente: ${TF_ENV}"
-            echo "⚙️  Acción: ${TF_ACTION}"
+              # Selección de carpeta Terraform
+              TARGET="${TF_WORKDIR}"
+              if [ ! -d "${TARGET}" ]; then
+                if   [ -d "terraform" ];       then TARGET="terraform"
+                elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+                else echo "❌ No se encontró directorio Terraform."; exit 1; fi
+              fi
 
-            terraform -chdir="${TARGET}" init -input=false -upgrade
-            terraform -chdir="${TARGET}" validate
+              TFVARS=""
+              if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+                TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+              fi
 
-            if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-              echo "⚠️  AWS creds no presentes: plan/apply podrían fallar si el provider las requiere."
-            fi
+              echo "📁 Directorio: ${TARGET}"
+              echo "🌱 Ambiente: ${TF_ENV}"
+              echo "⚙️  Acción: ${TF_ACTION}"
+              echo "🔗 API server en kubeconfig: $(grep -m1 '^\\s*server:' "${TF_VAR_kubeconfig_path}")"
 
-            if [ "${TF_ACTION}" = "plan" ] || [ "${TF_ACTION}" = "apply" ]; then
+              terraform -chdir="${TARGET}" init -input=false -upgrade
+              terraform -chdir="${TARGET}" validate
               terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
-            fi
 
-            if [ "${TF_ACTION}" = "apply" ]; then
-              terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
-            fi
-          '''
-          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+              if [ "${TF_ACTION}" = "apply" ]; then
+                terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+              fi
+
+              # Exporta plan en JSON (útil para artefacto/PR)
+              terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
+            '''
+            try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
         }
       }
     }
@@ -188,6 +209,6 @@ pipeline {
 
   post {
     success { echo "✅ Pipeline OK (Terraform: ${params.TF_ACTION})." }
-    always  { echo "📦 Reportes en 'reports/' (si hubo análisis)." }
+    always  { echo "📦 Reportes en 'reports/' (si hubo análisis/plan)." }
   }
 }
