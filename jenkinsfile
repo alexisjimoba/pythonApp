@@ -210,7 +210,7 @@ pipeline {
                 cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
                 # ---- FORZAR server: siempre al host/puerto indicados (evita 65026, 127.0.0.1, etc.)
-                API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
+                API_URL="http://${API_SERVER_HOST}:${API_SERVER_PORT}"
                 sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
                 # Preflight de conectividad (falla rápido si no hay acceso)
