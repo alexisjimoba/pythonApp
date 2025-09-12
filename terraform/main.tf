@@ -7,11 +7,13 @@ variable "kubeconfig_path" {
 
 provider "kubernetes" {
   config_path = pathexpand(var.kubeconfig_path)
+  insecure         = var.kube_insecure
 }
 
 provider "helm" {
   kubernetes {
     config_path = pathexpand(var.kubeconfig_path)
+    insecure         = var.kube_insecure
   }
 }
 
