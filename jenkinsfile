@@ -138,8 +138,11 @@ pipeline {
 
             echo "== Binarios instalados =="
             ls -l "${LOCAL_BIN}" || true
-            which checkov || true
-            checkov --version || echo "⚠️ checkov no disponible"
+            if command -v checkov >/dev/null 2>&1; then
+              checkov --version
+            else
+              echo "ℹ️ checkov no disponible"
+            fi
           '''
           try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
