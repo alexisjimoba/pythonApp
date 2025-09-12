@@ -1,4 +1,3 @@
-cat > Jenkinsfile <<'EOF'
 pipeline {
   agent any
 
@@ -14,8 +13,7 @@ pipeline {
 
   environment {
     LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${LOCAL_BIN}:${PATH}"
-
+    PATH          = "${WORKSPACE}/.bin:${PATH}"  // prefijo directo, sin depender del orden
     TF_WORKDIR    = 'terraform'
     TF_VERSION    = '1.6.6'
 
@@ -24,35 +22,45 @@ pipeline {
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout scm
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
+        script {
+          def cmd = '''#!/bin/bash
             set -euxo pipefail
             echo "== Entorno ==" && printenv | sort
-            which git || true
+            which git  || true; git  --version  || true
             which curl || true
             which wget || true
-            which jar || true
+            which jar  || true
             which python3 || true
           '''
+          try {
+            ansiColor('xterm') { sh cmd }
+          } catch (ignored) {
+            sh cmd
+          }
         }
       }
     }
 
     stage('Setup Tooling (sin apt)') {
       steps {
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
+        script {
+          def cmd = '''#!/bin/bash
             set -euxo pipefail
             mkdir -p "${LOCAL_BIN}"
 
-            dl() { URL="$1"; OUT="$2";
-              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
-              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
-              else echo "❌ No hay curl ni wget"; return 1; fi; }
+            # helper descarga (curl o wget)
+            dl() {
+              URL="$1"; OUT="$2"
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT"
+              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL"
+              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi
+            }
 
+            # tfsec (amd64/arm64)
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
               TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
@@ -66,8 +74,9 @@ pipeline {
 
             # tfsec
             dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" || true
+            tfsec --version || echo "⚠️ tfsec no disponible"
 
-            # terraform (extraer con 'jar')
+            # Terraform (zip) → extraer con 'jar' (incluido con Java/Jenkins)
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
               rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
@@ -77,6 +86,7 @@ pipeline {
             else
               echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
             fi
+            terraform -version || echo "⚠️ terraform no disponible"
 
             # checkov por pip si hay python3; si no, binario
             if command -v python3 >/dev/null 2>&1; then
@@ -85,22 +95,25 @@ pipeline {
             else
               if dl "$CKV_URL" "${LOCAL_BIN}/checkov"; then chmod +x "${LOCAL_BIN}/checkov"; fi
             fi
-
-            tfsec --version || echo "tfsec no disponible"
-            terraform -version || echo "terraform no disponible"
-            checkov --version || echo "checkov no disponible"
+            checkov --version || echo "⚠️ checkov no disponible"
           '''
+          try {
+            ansiColor('xterm') { sh cmd }
+          } catch (ignored) {
+            sh cmd
+          }
         }
       }
     }
 
     stage('Static Code Analysis: Terraform') {
       steps {
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
+        script {
+          def cmd = '''#!/bin/bash
             set -euxo pipefail
             mkdir -p reports
 
+            # Detecta carpeta con .tf
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
@@ -108,12 +121,13 @@ pipeline {
               else TARGET="."; fi
             fi
 
-            # validate temprano (si hay terraform CLI)
+            # validate temprano (si hay Terraform CLI)
             if command -v terraform >/dev/null 2>&1; then
               terraform -chdir="${TARGET}" init -backend=false -upgrade || true
               terraform -chdir="${TARGET}" validate || true
             fi
 
+            # ¿hay *.tf?
             if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
               echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
               exit 0
@@ -125,6 +139,11 @@ pipeline {
             command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
             command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
           '''
+          try {
+            ansiColor('xterm') { sh cmd }
+          } catch (ignored) {
+            sh cmd
+          }
         }
       }
       post {
@@ -132,8 +151,11 @@ pipeline {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
           script {
-            try { recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')] }
-            catch (err) { echo "Warnings NG no disponible: ${err}" }
+            try {
+              recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
+            } catch (err) {
+              echo "recordIssues/SARIF no disponible (¿Warnings NG no instalado?): ${err}"
+            }
           }
         }
       }
@@ -142,8 +164,8 @@ pipeline {
     stage('Terraform Init/Plan/Apply') {
       when { expression { params.TF_ACTION != 'none' } }
       steps {
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
+        script {
+          def cmd = '''#!/bin/bash
             set -euxo pipefail
 
             if ! command -v terraform >/dev/null 2>&1; then
@@ -151,20 +173,34 @@ pipeline {
               exit 1
             fi
 
+            # Selección de carpeta Terraform
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
               elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-              else echo "❌ No hay directorio Terraform"; exit 1; fi
+              else
+                echo "❌ No se encontró directorio Terraform. Abortando stage."
+                exit 1
+              fi
             fi
 
+            # tfvars por ambiente si existe
             TFVARS=""
             if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
               TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
             fi
 
+            echo "📁 Directorio: ${TARGET}"
+            echo "🌱 Ambiente: ${TF_ENV}"
+            echo "⚙️  Acción: ${TF_ACTION}"
+
             terraform -chdir="${TARGET}" init -input=false -upgrade
             terraform -chdir="${TARGET}" validate
+
+            # Aviso si no hay credenciales AWS
+            if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+              echo "⚠️  AWS creds no presentes: plan/apply podrían fallar si el provider las requiere."
+            fi
 
             if [ "${TF_ACTION}" = "plan" ] || [ "${TF_ACTION}" = "apply" ]; then
               terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
@@ -174,6 +210,11 @@ pipeline {
               terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
             fi
           '''
+          try {
+            ansiColor('xterm') { sh cmd }
+          } catch (ignored) {
+            sh cmd
+          }
         }
       }
     }
@@ -184,4 +225,3 @@ pipeline {
     always  { echo "📦 Reportes en 'reports/' (si hubo análisis)." }
   }
 }
-EOF
