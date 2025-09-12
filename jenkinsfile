@@ -9,12 +9,17 @@ pipeline {
   parameters {
     choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
     choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
-    string(name: 'API_SERVER_HOST',  defaultValue: '192.168.49.2', description: 'IP del API server (minikube ip)')
-    string(name: 'API_SERVER_PORT',  defaultValue: '8443',         description: 'Puerto del API server')
-    // Deja vacío para usar ruta directa (KUBE_CONFIG_PATH)
-    string(name: 'KUBE_CRED_ID',     defaultValue: '',             description: 'ID credencial (Secret file o Secret text) con kubeconfig')
-    // Úsalo si montas el kubeconfig en el contenedor (p.ej. /kubeconfig)
-    string(name: 'KUBE_CONFIG_PATH', defaultValue: '/kubeconfig',  description: 'Ruta kubeconfig en el agente (fallback si no hay credencial)')
+
+    // 👉 Windows + Docker Desktop: apunta al host de Windows visto desde el contenedor
+    string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal',
+           description: 'Host del API server (Windows: host.docker.internal)')
+    string(name: 'API_SERVER_PORT', defaultValue: '8443',
+           description: 'Puerto del API server')
+
+    // Credencial opcional con kubeconfig (Secret file o Secret text). Si la dejas vacía, usa KUBE_CONFIG_PATH
+    string(name: 'KUBE_CRED_ID',     defaultValue: '',            description: 'ID credencial (Secret file o Secret text) con kubeconfig')
+    // Ruta del kubeconfig dentro del agente. Útil si montas el archivo: -v C:\\Users\\tuUsuario\\kubeconfig-minikube:/kubeconfig:ro
+    string(name: 'KUBE_CONFIG_PATH', defaultValue: '/kubeconfig', description: 'Ruta kubeconfig en el agente (fallback si no hay credencial)')
   }
 
   environment {
@@ -60,10 +65,12 @@ pipeline {
             which jar  || true
             which python3 || true
 
-            dl() { URL="$1"; OUT="$2";
-              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
-              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
-              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi; }
+            dl() {
+              URL="$1"; OUT="$2"
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT"
+              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL"
+              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi
+            }
 
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
@@ -81,7 +88,7 @@ pipeline {
               echo "⚠️ tfsec no disponible"
             }
 
-            # --- Terraform (zip) → extraer con 'jar' ---
+            # --- Terraform (zip) → extraer con 'jar' (sin unzip) ---
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
               rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
@@ -101,7 +108,7 @@ pipeline {
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
 
-            # 2) Si no quedó disponible, probamos binario ZIP
+            # 2) Si no quedó disponible, probamos binario ZIP (puede fallar por GLIBC)
             if ! command -v checkov >/dev/null 2>&1; then
               echo "ℹ️ Intentando Checkov como binario (sin Python)"
               if command -v jar >/dev/null 2>&1; then
@@ -209,8 +216,8 @@ pipeline {
                 export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
                 cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
-                # ---- FORZAR server: siempre al host/puerto indicados (evita 65026, 127.0.0.1, etc.)
-                API_URL="http://${API_SERVER_HOST}:${API_SERVER_PORT}"
+                # ---- FORZAR server: siempre al host/puerto indicados (evita 127.0.0.1, puertos dinámicos, etc.)
+                API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
                 sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
                 # Preflight de conectividad (falla rápido si no hay acceso)
