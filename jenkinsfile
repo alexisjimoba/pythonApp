@@ -198,101 +198,108 @@ pipeline {
     }
 
     stage('Terraform Init/Plan/Apply') {
-      when { expression { params.TF_ACTION != 'none' } }
-      steps {
-        script {
-          // Helper para ejecutar Terraform con ruta de kubeconfig ya resuelta
-          def runWithKubeconfig = { String kubePath ->
-            withEnv(["KC_PATH=${kubePath}"]) {
-              def cmd = '''#!/bin/sh
-                set -eu
-                mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
-                export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
-                cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
+  when { expression { params.TF_ACTION != 'none' } }
+  steps {
+    script {
+      // Helper para ejecutar Terraform con ruta de kubeconfig ya resuelta
+      def runWithKubeconfig = { String kubePath ->
+        withEnv(["KC_PATH=${kubePath}"]) {
+          def cmd = '''#!/bin/sh
+            set -eu
+            mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
+            export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
+            cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
-                # Reescribe 127.0.0.1 -> host/puerto parametrizados si aplica
-                grep -q '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" && \
-                grep -q '^[[:space:]]*server:[[:space:]]*https\\?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}" && \
-                  sed -E "s#(^[[:space:]]*server:[[:space:]]*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
+            # ---- FORZAR server: siempre al host/puerto indicados (evita 65026, 127.0.0.1, etc.)
+            API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
+            # Reemplaza toda la línea 'server: ...' por 'server: https://HOST:PORT'
+            # (sin usar $(...) para compatibilidad con /bin/sh)
+            sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
-                export KUBECONFIG="${TF_VAR_kubeconfig_path}"
-                export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
-                echo "🔗 API server en kubeconfig:"
-                grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
+            # Preflight de conectividad (evita esperar al timeout de Terraform)
+            if command -v curl >/dev/null 2>&1; then
+              curl -k -m 5 -sS "${API_URL}/version" >/dev/null || {
+                echo "❌ No hay conectividad al API server ${API_URL} desde el contenedor"; exit 1; }
+            fi
 
-                TARGET="${TF_WORKDIR}"
-                if [ ! -d "${TARGET}" ]; then
-                  if   [ -d "terraform" ];       then TARGET="terraform"
-                  elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-                  else echo "❌ No se encontró directorio Terraform."; exit 1; fi
-                fi
+            export KUBECONFIG="${TF_VAR_kubeconfig_path}"
+            export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
+            echo "🔗 API server final en kubeconfig:"
+            grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
 
-                TFVARS=""
-                if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
-                  TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
-                fi
+            TARGET="${TF_WORKDIR}"
+            if [ ! -d "${TARGET}" ]; then
+              if   [ -d "terraform" ];       then TARGET="terraform"
+              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+              else echo "❌ No se encontró directorio Terraform."; exit 1; fi
+            fi
 
-                terraform -chdir="${TARGET}" init -input=false -upgrade
-                terraform -chdir="${TARGET}" validate
-                terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+            TFVARS=""
+            if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+              TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+            fi
 
-                if [ "${TF_ACTION}" = "apply" ]; then
-                  terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
-                fi
+            terraform -chdir="${TARGET}" init -input=false -upgrade
+            terraform -chdir="${TARGET}" validate
+            terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
 
-                terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
-              '''
-              try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
-            }
-          }
+            if [ "${TF_ACTION}" = "apply" ]; then
+              terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+            fi
 
-          boolean used = false
-
-          // 1) Intentar credencial como Secret file
-          if (params.KUBE_CRED_ID?.trim()) {
-            try {
-              withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_FILE')]) {
-                echo "Usando credencial como Secret file: ${params.KUBE_CRED_ID}"
-                runWithKubeconfig(KCF_FILE); used = true
-              }
-            } catch (e1) {
-              echo "No es Secret file (${params.KUBE_CRED_ID}): ${e1}"
-            }
-          }
-
-          // 2) Intentar credencial como Secret text
-          if (!used && params.KUBE_CRED_ID?.trim()) {
-            try {
-              withCredentials([string(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_TEXT')]) {
-                echo "Usando credencial como Secret text: ${params.KUBE_CRED_ID}"
-                def kcPath = "${WORKSPACE}/.kube/kubeconfig_from_secret_text"
-                writeFile file: kcPath, text: KCF_TEXT
-                runWithKubeconfig(kcPath); used = true
-              }
-            } catch (e2) {
-              echo "Tampoco es Secret text (${params.KUBE_CRED_ID}): ${e2}"
-            }
-          }
-
-          // 3) Fallback por ruta
-          if (!used) {
-            if (params.KUBE_CONFIG_PATH?.trim()) {
-              echo "Usando KUBE_CONFIG_PATH=${params.KUBE_CONFIG_PATH}"
-              runWithKubeconfig(params.KUBE_CONFIG_PATH)
-            } else {
-              error "No hay credencial '${params.KUBE_CRED_ID}' y KUBE_CONFIG_PATH está vacío. " +
-                    "Monta el kubeconfig (-v ...:/kubeconfig) y pon KUBE_CONFIG_PATH=/kubeconfig, o crea la credencial."
-            }
-          }
+            terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
+          '''
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
       }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
+
+      boolean used = false
+
+      // 1) Credencial como Secret file
+      if (params.KUBE_CRED_ID?.trim()) {
+        try {
+          withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_FILE')]) {
+            echo "Usando credencial como Secret file: ${params.KUBE_CRED_ID}"
+            runWithKubeconfig(KCF_FILE); used = true
+          }
+        } catch (e1) {
+          echo "No es Secret file (${params.KUBE_CRED_ID}): ${e1}"
+        }
+      }
+
+      // 2) Credencial como Secret text
+      if (!used && params.KUBE_CRED_ID?.trim()) {
+        try {
+          withCredentials([string(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_TEXT')]) {
+            echo "Usando credencial como Secret text: ${params.KUBE_CRED_ID}"
+            def kcPath = "${WORKSPACE}/.kube/kubeconfig_from_secret_text"
+            writeFile file: kcPath, text: KCF_TEXT
+            runWithKubeconfig(kcPath); used = true
+          }
+        } catch (e2) {
+          echo "Tampoco es Secret text (${params.KUBE_CRED_ID}): ${e2}"
+        }
+      }
+
+      // 3) Fallback por ruta
+      if (!used) {
+        if (params.KUBE_CONFIG_PATH?.trim()) {
+          echo "Usando KUBE_CONFIG_PATH=${params.KUBE_CONFIG_PATH}"
+          runWithKubeconfig(params.KUBE_CONFIG_PATH)
+        } else {
+          error "No hay credencial '${params.KUBE_CRED_ID}' y KUBE_CONFIG_PATH está vacío. " +
+                "Monta el kubeconfig (-v ...:/kubeconfig) y pon KUBE_CONFIG_PATH=/kubeconfig, o crea la credencial."
         }
       }
     }
   }
+  post {
+    always {
+      archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
+    }
+  }
+}
+
 
   post {
     success { echo "✅ Pipeline OK (Terraform: ${params.TF_ACTION})." }
