@@ -13,8 +13,9 @@ pipeline {
     // 👉 Windows + Docker Desktop: apunta al host de Windows visto desde el contenedor
     string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal',
            description: 'Host del API server (Windows: host.docker.internal)')
-    string(name: 'API_SERVER_PORT', defaultValue: '8443',
-           description: 'Puerto del API server')
+    // Usa el puerto real de tu kubeconfig (p.ej. 49230). Si cambia, actualízalo al lanzar el build.
+    string(name: 'API_SERVER_PORT', defaultValue: '49230',
+           description: 'Puerto del API server (desde kubeconfig del host)')
 
     // Credencial opcional con kubeconfig (Secret file o Secret text). Si la dejas vacía, usa KUBE_CONFIG_PATH
     string(name: 'KUBE_CRED_ID',     defaultValue: '',            description: 'ID credencial (Secret file o Secret text) con kubeconfig')
@@ -216,13 +217,20 @@ pipeline {
                 export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
                 cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
-                # ---- FORZAR server: siempre al host/puerto indicados (evita 127.0.0.1, puertos dinámicos, etc.)
+                # ---- FORZAR server: al host/puerto alcanzables
                 API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
                 sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
+                # ---- DESACTIVAR validación TLS (solo CI): usar insecure-skip-tls-verify
+                # 1) Elimina cualquier certificate-authority / certificate-authority-data
+                sed -E -i '/^[[:space:]]*certificate-authority(-data)?:/d' "${TF_VAR_kubeconfig_path}"
+                # 2) Inserta insecure-skip-tls-verify: true debajo de server: si no existe
+                grep -q '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || \
+                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  insecure-skip-tls-verify: true' "${TF_VAR_kubeconfig_path}"
+
                 # Preflight de conectividad (falla rápido si no hay acceso)
                 if command -v curl >/dev/null 2>&1; then
-                  curl -k -m 5 -sS "${API_URL}/version" >/dev/null || {
+                  curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null || {
                     echo "❌ No hay conectividad al API server ${API_URL} desde el contenedor"; exit 1; }
                 fi
 
@@ -230,6 +238,7 @@ pipeline {
                 export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
                 echo "🔗 API server final en kubeconfig:"
                 grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
+                grep -m1 '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || true
 
                 TARGET="${TF_WORKDIR}"
                 if [ ! -d "${TARGET}" ]; then
