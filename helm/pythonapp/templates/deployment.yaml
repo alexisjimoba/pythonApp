@@ -1,36 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "pythonapp.fullname" . }}
+  name: {{ .Release.Name }}-deploy
   labels:
-    app: {{ include "pythonapp.name" . }}
+    app.kubernetes.io/name: pythonapp
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app: {{ include "pythonapp.name" . }}
+      app.kubernetes.io/name: pythonapp
+      app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app: {{ include "pythonapp.name" . }}
+        app.kubernetes.io/name: pythonapp
+        app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
       containers:
-        - name: {{ include "pythonapp.name" . }}
+        - name: pythonapp
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: {{ .Values.service.targetPort }}
-          readinessProbe:
-            httpGet:
-              path: /
-              port: {{ .Values.service.targetPort }}
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /
-              port: {{ .Values.service.targetPort }}
-            initialDelaySeconds: 10
-            periodSeconds: 20
+            - name: http
+              containerPort: 80
+              protocol: TCP
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}

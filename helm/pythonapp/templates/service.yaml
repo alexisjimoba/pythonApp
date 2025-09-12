@@ -1,18 +1,18 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "pythonapp.fullname" . }}
+  name: {{ .Release.Name }}-svc
   labels:
-    app: {{ include "pythonapp.name" . }}
+    app.kubernetes.io/name: pythonapp
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   type: {{ .Values.service.type }}
-  selector:
-    app: {{ include "pythonapp.name" . }}
   ports:
-    - port: {{ .Values.service.port }}
-      targetPort: {{ .Values.service.targetPort }}
-      protocol: TCP
-      name: http
+    - port: 80
+      targetPort: http
       {{- if eq .Values.service.type "NodePort" }}
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
+  selector:
+    app.kubernetes.io/name: pythonapp
+    app.kubernetes.io/instance: {{ .Release.Name }}

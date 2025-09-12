@@ -1,16 +1,18 @@
+# Número de réplicas
 replicaCount: 1
 
+# Imagen del contenedor
 image:
-  repository: pythonapp
-  tag: "latest"
+  repository: ghcr.io/example/pythonapp
+  tag: latest
   pullPolicy: IfNotPresent
 
+# Configuración del servicio
 service:
-  type: NodePort
-  port: 80
-  targetPort: 8000
-  nodePort: 30080
+  type: ClusterIP   # opciones: ClusterIP, NodePort, LoadBalancer
+  nodePort: 30080   # solo aplica si service.type = NodePort
 
+# Recursos
 resources:
   limits:
     cpu: 500m
@@ -19,17 +21,11 @@ resources:
     cpu: 100m
     memory: 128Mi
 
+# Ingress
 ingress:
   enabled: false
-  className: ""
   hosts:
-    - host: pythonapp.local
+    - host: example.local
       paths:
         - path: /
           pathType: Prefix
-
-autoscaling:
-  enabled: false
-  minReplicas: 1
-  maxReplicas: 3
-  targetCPUUtilizationPercentage: 80

@@ -2,9 +2,10 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "pythonapp.fullname" . }}
+  name: {{ .Release.Name }}-ing
   labels:
-    {{- include "pythonapp.labels" . | nindent 4 }}
+    app.kubernetes.io/name: pythonapp
+    app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   rules:
   {{- range .Values.ingress.hosts }}
@@ -16,7 +17,7 @@ spec:
             pathType: {{ .pathType | default "Prefix" }}
             backend:
               service:
-                name: {{ include "pythonapp.fullname" $ }}
+                name: {{ $.Release.Name }}-svc
                 port:
                   number: 80
         {{- end }}
