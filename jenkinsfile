@@ -33,8 +33,8 @@ pipeline {
       steps {
         checkout scm
         script {
-          def cmd = '''#!/bin/bash
-            set -eux
+          def cmd = '''#!/bin/sh
+            set -eu
             echo "== Entorno ==" && printenv | sort
             which git  || true; git  --version  || true
             which curl || true
@@ -50,8 +50,8 @@ pipeline {
     stage('Setup Tooling (sin apt)') {
       steps {
         script {
-          def cmd = '''#!/bin/bash
-            set -eux
+          def cmd = '''#!/bin/sh
+            set -eu
             mkdir -p "${LOCAL_BIN}"
 
             echo "PATH=${PATH}"
@@ -107,7 +107,8 @@ pipeline {
               if command -v jar >/dev/null 2>&1; then
                 if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
                   rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
-                  CKV_BIN=$(find .ckvzip -type f -name 'checkov' -print -quit || true)
+                  # usar POSIX sin $()
+                  CKV_BIN="$(find .ckvzip -type f -name checkov | head -n 1 || true)"
                   if [ -n "${CKV_BIN}" ]; then
                     mv "${CKV_BIN}" "${LOCAL_BIN}/checkov"
                     chmod +x "${LOCAL_BIN}/checkov"
@@ -123,17 +124,17 @@ pipeline {
 
             # 3) Si el binario existe pero falla por GLIBC, lo deshabilitamos
             if [ -x "${LOCAL_BIN}/checkov" ]; then
-              if ! "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1; then
-                ERR="$("${LOCAL_BIN}/checkov" --version 2>&1 || true)"
+              "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || {
+                ERR="$( ${LOCAL_BIN}/checkov --version 2>&1 || true )"
                 echo "$ERR" || true
-                if echo "$ERR" | grep -q 'GLIBC_2\\.38'; then
-                  echo "⚠️ GLIBC del contenedor es antigua; deshabilitando Checkov (usaremos solo tfsec)."
+                echo "$ERR" | grep -q 'GLIBC_2\\.38' && {
+                  echo "⚠️ GLIBC antigua; deshabilitando Checkov (solo tfsec)."
                   rm -f "${LOCAL_BIN}/checkov"
-                else
+                } || {
                   echo "⚠️ Checkov no ejecuta; se omitirá."
                   rm -f "${LOCAL_BIN}/checkov" || true
-                fi
-              fi
+                }
+              }
             fi
 
             echo "== Binarios instalados =="
@@ -152,8 +153,8 @@ pipeline {
     stage('Static Code Analysis: Terraform') {
       steps {
         script {
-          def cmd = '''#!/bin/bash
-            set -eux
+          def cmd = '''#!/bin/sh
+            set -eu
             mkdir -p reports
 
             TARGET="${TF_WORKDIR}"
@@ -200,46 +201,49 @@ pipeline {
       when { expression { params.TF_ACTION != 'none' } }
       steps {
         script {
-          // Ejecuta Terraform con una ruta de kubeconfig ya resuelta
+          // Helper para ejecutar Terraform con ruta de kubeconfig ya resuelta
           def runWithKubeconfig = { String kubePath ->
-            def cmd = '''#!/bin/bash
-              set -eux
-              mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
-              export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
-              cp '"'''+kubePath+'''"'" "${TF_VAR_kubeconfig_path}"
+            withEnv(["KC_PATH=${kubePath}"]) {
+              def cmd = '''#!/bin/sh
+                set -eu
+                mkdir -p "${WORKSPACE}/.kube" "${WORKSPACE}/reports"
+                export TF_VAR_kubeconfig_path="${WORKSPACE}/.kube/kubeconfig"
+                cp "${KC_PATH}" "${TF_VAR_kubeconfig_path}"
 
-              # Reescribe 127.0.0.1 -> host/puerto parametrizados si aplica (caso Docker Desktop)
-              if grep -qE '^\\s*server:\\s*https?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}"; then
-                sed -E "s#(^\\s*server:\\s*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
-              fi
+                # Reescribe 127.0.0.1 -> host/puerto parametrizados si aplica
+                grep -q '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" && \
+                grep -q '^[[:space:]]*server:[[:space:]]*https\\?://127\\.0\\.0\\.1' "${TF_VAR_kubeconfig_path}" && \
+                  sed -E "s#(^[[:space:]]*server:[[:space:]]*)https?://[^:]+:[0-9]+#\\1https://${API_SERVER_HOST}:${API_SERVER_PORT}#" -i "${TF_VAR_kubeconfig_path}" || true
 
-              export KUBECONFIG="${TF_VAR_kubeconfig_path}"
-              export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
-              echo "🔗 API server: $(grep -m1 '^\\s*server:' "${TF_VAR_kubeconfig_path}")"
+                export KUBECONFIG="${TF_VAR_kubeconfig_path}"
+                export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
+                echo "🔗 API server en kubeconfig:"
+                grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
 
-              TARGET="${TF_WORKDIR}"
-              if [ ! -d "${TARGET}" ]; then
-                if   [ -d "terraform" ];       then TARGET="terraform"
-                elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-                else echo "❌ No se encontró directorio Terraform."; exit 1; fi
-              fi
+                TARGET="${TF_WORKDIR}"
+                if [ ! -d "${TARGET}" ]; then
+                  if   [ -d "terraform" ];       then TARGET="terraform"
+                  elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+                  else echo "❌ No se encontró directorio Terraform."; exit 1; fi
+                fi
 
-              TFVARS=""
-              if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
-                TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
-              fi
+                TFVARS=""
+                if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+                  TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+                fi
 
-              terraform -chdir="${TARGET}" init -input=false -upgrade
-              terraform -chdir="${TARGET}" validate
-              terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+                terraform -chdir="${TARGET}" init -input=false -upgrade
+                terraform -chdir="${TARGET}" validate
+                terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
 
-              if [ "${TF_ACTION}" = "apply" ]; then
-                terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
-              fi
+                if [ "${TF_ACTION}" = "apply" ]; then
+                  terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+                fi
 
-              terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
-            '''
-            try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+                terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
+              '''
+              try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
+            }
           }
 
           boolean used = false
