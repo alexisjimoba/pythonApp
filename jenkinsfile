@@ -10,7 +10,7 @@ pipeline {
     choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
     choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
 
-    // 👉 Windows + Docker Desktop: apunta al host de Windows visto desde el contenedor
+    // Windows + Docker Desktop: el host visto desde el contenedor
     string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal',
            description: 'Host del API server (Windows: host.docker.internal)')
     // Usa el puerto real de tu kubeconfig (ej. 49230). Si cambia, actualízalo al lanzar el build.
@@ -60,12 +60,6 @@ pipeline {
             set -eu
             mkdir -p "${LOCAL_BIN}"
 
-            echo "PATH=${PATH}"
-            which curl || true
-            which wget || true
-            which jar  || true
-            which python3 || true
-
             dl() {
               URL="$1"; OUT="$2"
               if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT"
@@ -84,12 +78,10 @@ pipeline {
               CKV_ZIP="checkov_linux_arm64.zip"
             fi
 
-            # --- tfsec ---
-            ( dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" && "${LOCAL_BIN}/tfsec" --version ) || {
-              echo "⚠️ tfsec no disponible"
-            }
+            # tfsec
+            ( dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" && "${LOCAL_BIN}/tfsec" --version ) || echo "⚠️ tfsec no disponible"
 
-            # --- Terraform (zip) → extraer con 'jar' (sin unzip) ---
+            # Terraform (zip) con 'jar'
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
               rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
@@ -101,14 +93,13 @@ pipeline {
               echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
             fi
 
-            # --- Checkov (opcional) ---
+            # Checkov (best-effort)
             if command -v python3 >/dev/null 2>&1; then
               python3 -m pip install --no-cache-dir --upgrade pip || true
               python3 -m pip install --no-cache-dir --user checkov || true
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
             if ! command -v checkov >/dev/null 2>&1; then
-              echo "ℹ️ Intentando Checkov como binario (sin Python)"
               if command -v jar >/dev/null 2>&1; then
                 if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
                   rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
@@ -119,12 +110,8 @@ pipeline {
               fi
             fi
             if [ -x "${LOCAL_BIN}/checkov" ]; then
-              "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || {
-                echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
+              "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || { echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
             fi
-
-            echo "== Binarios instalados =="; ls -l "${LOCAL_BIN}" || true
-            command -v checkov >/dev/null 2>&1 && checkov --version || echo "ℹ️ checkov no disponible"
           '''
           try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
@@ -137,7 +124,6 @@ pipeline {
           def cmd = '''#!/bin/sh
             set -eu
             mkdir -p reports
-
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
@@ -193,17 +179,14 @@ pipeline {
                 API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
                 sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
-                # ---- TLS correcto (sin desactivar CA):
-                # 1) Elimina cualquier 'insecure-skip-tls-verify' previo
-                sed -E -i '/^[[:space:]]*insecure-skip-tls-verify:/d' "${TF_VAR_kubeconfig_path}"
-                # 2) Añade/actualiza SNI para que el cert del apiserver (incluye "localhost") valide bien
-                if grep -q '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}"; then
-                  sed -E -i 's#^([[:space:]]*tls-server-name:).*$#\\1 localhost#' "${TF_VAR_kubeconfig_path}"
-                else
-                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  tls-server-name: localhost' "${TF_VAR_kubeconfig_path}"
-                fi
+                # ---- DESACTIVAR validación TLS (solo CI): usar insecure-skip-tls-verify
+                # 1) Elimina cualquier certificate-authority / certificate-authority-data
+                sed -E -i '/^[[:space:]]*certificate-authority(-data)?:/d' "${TF_VAR_kubeconfig_path}"
+                # 2) Inserta insecure-skip-tls-verify: true debajo de server: si no existe
+                grep -q '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || \
+                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  insecure-skip-tls-verify: true' "${TF_VAR_kubeconfig_path}"
 
-                # Preflight de conectividad (reachability, sin validar cert)
+                # Preflight de conectividad (reachability)
                 if command -v curl >/dev/null 2>&1; then
                   curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null || {
                     echo "❌ No hay conectividad al API server ${API_URL} desde el contenedor"; exit 1; }
@@ -211,9 +194,9 @@ pipeline {
 
                 export KUBECONFIG="${TF_VAR_kubeconfig_path}"
                 export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
-                echo "🔗 Entradas kubeconfig:"
+                echo "🔗 kubeconfig server:"
                 grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
-                grep -m1 '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}" || true
+                grep -m1 '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || true
 
                 TARGET="${TF_WORKDIR}"
                 if [ ! -d "${TARGET}" ]; then
