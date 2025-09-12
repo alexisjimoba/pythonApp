@@ -1,19 +1,12 @@
-provider "kubernetes" {
-  config_path    = pathexpand("~/.kube/config")
-  config_context = "minikube"
-}
-
-provider "helm" {
-  kubernetes {
-    config_path    = pathexpand("~/.kube/config")
-    config_context = "minikube"
+terraform {
+  required_providers {
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.13"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.30"
+    }
   }
-}
-
-resource "kubernetes_namespace" "ns" {
-  metadata { name = var.namespace }
-}
-
-output "namespace" {
-  value = kubernetes_namespace.ns.metadata[0].name
 }
