@@ -9,8 +9,8 @@ image:
 
 # Configuración del servicio
 service:
-  type: ClusterIP   # opciones: ClusterIP, NodePort, LoadBalancer
-  nodePort: 30080   # solo aplica si service.type = NodePort
+  type: ClusterIP
+  nodePort: 30080
 
 # Recursos
 resources:
@@ -29,3 +29,10 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
+
+# Autoescalado
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
