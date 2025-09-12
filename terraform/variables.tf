@@ -69,11 +69,6 @@ variable "ingress_host" {
   default = "example.local"
 }
 
-variable "kubeconfig_path" {
-  type        = string
-  description = "Ruta del kubeconfig que usará Terraform"
-  default     = "./.kube/kubeconfig"
-}
 
 variable "kube_insecure" {
   type        = bool
