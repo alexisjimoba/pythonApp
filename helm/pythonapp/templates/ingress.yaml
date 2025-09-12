@@ -14,5 +14,6 @@ spec:
               service:
                 name: {{ include "pythonapp.fullname" . }}
                 port:
-                  number: {{ .Values.service.port }}
+                  number: 80
+
 {{- end }}
