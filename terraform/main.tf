@@ -1,12 +1,18 @@
-terraform {
-  required_providers {
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.13"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.30"
-    }
+############################################
+# main.tf — solo providers (sin required_providers)
+############################################
+
+variable "kubeconfig_path" {
+  type    = string
+  default = "~/.kube/config"
+}
+
+provider "kubernetes" {
+  config_path = pathexpand(var.kubeconfig_path)
+}
+
+provider "helm" {
+  kubernetes {
+    config_path = pathexpand(var.kubeconfig_path)
   }
 }
