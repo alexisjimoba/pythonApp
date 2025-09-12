@@ -10,19 +10,20 @@ pipeline {
 
   parameters {
     choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción a ejecutar')
-    string(name: 'APP_REPO',   defaultValue: 'https://github.com/alexisjimoba/pythonApp.git', description: 'Repo de la app')
-    string(name: 'APP_BRANCH', defaultValue: 'main', description: 'Rama de la app')
-    string(name: 'NAMESPACE',    defaultValue: 'pythonapp', description: 'K8s namespace')
-    string(name: 'RELEASE_NAME', defaultValue: 'pythonapp', description: 'Nombre de release Helm')
-    string(name: 'REPLICAS',     defaultValue: '1', description: 'Réplicas')
-    string(name: 'SERVICE_TYPE', defaultValue: 'NodePort', description: 'Tipo de Service (NodePort/ClusterIP)')
-    string(name: 'NODE_PORT',    defaultValue: '30080', description: 'NodePort (si aplica)')
-    booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
-    string(name: 'INGRESS_HOST', defaultValue: 'pythonapp.local', description: 'Host de Ingress')
-  }
+    // Imagen YA existente (no se construye aquí)
+    string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repo de la imagen (por ej. registry/myproj/pythonapp)')
+    string(name: 'IMAGE_TAG',        defaultValue: 'latest',    description: 'Tag de la imagen')
 
-  environment {
-    APP_DIR = 'app' // carpeta local para clonar la app
+    // K8s / Helm
+    string(name: 'NAMESPACE',     defaultValue: 'pythonapp', description: 'Namespace destino')
+    string(name: 'RELEASE_NAME',  defaultValue: 'pythonapp', description: 'Nombre del release Helm')
+    string(name: 'REPLICAS',      defaultValue: '1',         description: 'Réplicas')
+    string(name: 'SERVICE_TYPE',  defaultValue: 'NodePort',  description: 'Service type (NodePort/ClusterIP)')
+    string(name: 'SERVICE_PORT',  defaultValue: '80',        description: 'Service port (externo)')
+    string(name: 'TARGET_PORT',   defaultValue: '8000',      description: 'Puerto del contenedor (app)')
+    string(name: 'NODE_PORT',     defaultValue: '30080',     description: 'NodePort (si SERVICE_TYPE=NodePort)')
+    booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
+    string(name: 'INGRESS_HOST',  defaultValue: 'pythonapp.local', description: 'Host del Ingress')
   }
 
   stages {
@@ -31,10 +32,9 @@ pipeline {
       steps {
         sh '''
           set -e
-          for t in docker minikube kubectl terraform helm git curl; do
-            command -v $t >/dev/null || { echo "Falta $t en el contenedor Jenkins: $t"; exit 1; }
+          for t in kubectl terraform helm git curl; do
+            command -v $t >/dev/null || { echo "Falta $t en el agente Jenkins: $t"; exit 1; }
           done
-          docker info >/dev/null || { echo "Docker no accesible. Monta /var/run/docker.sock y usa --user root"; exit 1; }
         '''
       }
     }
@@ -43,116 +43,66 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Minikube up (docker driver)') {
+    stage('Terraform apply / destroy (sin Docker)') {
       steps {
-        sh '''
-          set -e
-          if ! minikube status -p minikube >/dev/null 2>&1; then
-            minikube start -p minikube --driver=docker --cpus=2 --memory=2048
-          fi
-        '''
-      }
-    }
+        withCredentials([
+          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
+        ]) {
+          withEnv([
+            "TF_VAR_namespace=${params.NAMESPACE}",
+            "TF_VAR_release_name=${params.RELEASE_NAME}",
+            "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
+            "TF_VAR_image_tag=${params.IMAGE_TAG}",
+            "TF_VAR_replicas=${params.REPLICAS}",
+            "TF_VAR_service_type=${params.SERVICE_TYPE}",
+            "TF_VAR_service_port=${params.SERVICE_PORT}",
+            "TF_VAR_service_target_port=${params.TARGET_PORT}",
+            "TF_VAR_node_port=${params.NODE_PORT}",
+            "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
+            "TF_VAR_ingress_host=${params.INGRESS_HOST}"
+          ]) {
+            sh '''
+              set -e
+              # Garantiza que el provider NO intente leer kubeconfig
+              unset KUBECONFIG
 
-    stage('Build image from pythonApp') {
-      when { expression { params.ACTION == 'deploy' } }
-      steps {
-        sh '''
-          set -e
-          mkdir -p "${APP_DIR}"
-          if [ ! -d "${APP_DIR}/.git" ]; then
-            git clone "${APP_REPO}" "${APP_DIR}"
-          fi
-          git -C "${APP_DIR}" fetch --all
-          git -C "${APP_DIR}" checkout "${APP_BRANCH}"
-          git -C "${APP_DIR}" pull --ff-only origin "${APP_BRANCH}"
-
-          # Tag = commit corto
-          COMMIT="$(git -C "${APP_DIR}" rev-parse --short HEAD)"
-          echo -n "$COMMIT" > image_tag.txt
-          echo "Usando tag: ${COMMIT}"
-
-          # Build dentro de Minikube
-          minikube image build -p minikube -t pythonapp:${COMMIT} -t pythonapp:latest "${APP_DIR}"
-        '''
-      }
-    }
-
-    stage('Deploy (Terraform + Helm)') {
-      when { expression { params.ACTION == 'deploy' } }
-      steps {
-        sh '''
-          set -e
-
-          # Detectar service.targetPort desde EXPOSE del Dockerfile (fallback 8000)
-          SERVICE_TARGET_PORT="$(grep -iE '^[[:space:]]*EXPOSE[[:space:]]+[0-9]+' "${APP_DIR}/Dockerfile" | head -n1 | sed -E 's/.*EXPOSE[[:space:]]+([0-9]+).*/\\1/i' || true)"
-          [ -z "${SERVICE_TARGET_PORT}" ] && SERVICE_TARGET_PORT=8000
-          echo "service.targetPort = ${SERVICE_TARGET_PORT}"
-
-          # Credenciales directas para providers (sin kubeconfig)
-          kubectl config use-context minikube >/dev/null 2>&1 || true
-          export TF_VAR_k8s_host="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.server}')"
-          export TF_VAR_k8s_cluster_ca="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
-          export TF_VAR_k8s_client_cert="$(kubectl config view --minify --raw -o jsonpath='{.users[0].user.client-certificate-data}')"
-          export TF_VAR_k8s_client_key="$(kubectl config view --minify --raw -o jsonpath='{.users[0].user.client-key-data}')"
-          unset KUBECONFIG
-
-          # Variables para el chart
-          export TF_VAR_namespace="${NAMESPACE}"
-          export TF_VAR_release_name="${RELEASE_NAME}"
-          export TF_VAR_image_repository="pythonapp"
-          export TF_VAR_image_tag="$(cat image_tag.txt)"
-          export TF_VAR_replicas="${REPLICAS}"
-          export TF_VAR_service_type="${SERVICE_TYPE}"
-          export TF_VAR_node_port="${NODE_PORT}"
-          export TF_VAR_service_port="80"
-          export TF_VAR_service_target_port="${SERVICE_TARGET_PORT}"
-          export TF_VAR_ingress_enabled="${INGRESS_ENABLED}"
-          export TF_VAR_ingress_host="${INGRESS_HOST}"
-
-          cd terraform
-          terraform init -upgrade
-          terraform apply -auto-approve
-        '''
-      }
-    }
-
-    stage('Smoke test & URL') {
-      when { expression { params.ACTION == 'deploy' } }
-      steps {
-        script {
-          // Obtiene la URL si es NodePort
-          if (params.SERVICE_TYPE == 'NodePort') {
-            def url = sh(returnStdout: true, script: "minikube service '${params.RELEASE_NAME}' -n '${params.NAMESPACE}' --url").trim()
-            writeFile file: 'service_url.txt', text: url
-            sh "\"curl\" -fsS ${url} | head -n 5 || true"
-            currentBuild.description = "URL: ${url}"
-            archiveArtifacts artifacts: 'service_url.txt', onlyIfSuccessful: true
-            echo "Service URL: ${url}"
-          } else {
-            echo "SERVICE_TYPE=${params.SERVICE_TYPE}. No se genera URL via NodePort."
+              cd terraform
+              terraform init -upgrade
+              if [ "${ACTION}" = "destroy" ]; then
+                terraform destroy -auto-approve
+              else
+                terraform apply -auto-approve
+              fi
+            '''
           }
         }
       }
     }
 
-    stage('Destroy') {
-      when { expression { params.ACTION == 'destroy' } }
+    stage('Post-deploy check') {
+      when { expression { params.ACTION == 'deploy' } }
       steps {
-        sh '''
-          set -e
-          # Credenciales directas nuevamente (sin kubeconfig)
-          kubectl config use-context minikube >/dev/null 2>&1 || true
-          export TF_VAR_k8s_host="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.server}')"
-          export TF_VAR_k8s_cluster_ca="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
-          export TF_VAR_k8s_client_cert="$(kubectl config view --minify --raw -o jsonpath='{.users[0].user.client-certificate-data}')"
-          export TF_VAR_k8s_client_key="$(kubectl config view --minify --raw -o jsonpath='{.users[0].user.client-key-data}')"
-          unset KUBECONFIG
-
-          cd terraform
-          terraform init -upgrade
-          terraform destroy -auto-approve || true
-        '''
+        // Chequeos genéricos (sin Docker/minikube)
+        withCredentials([
+          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
+          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
+          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
+          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
+        ]) {
+          sh '''
+            set -e
+            # Crea kubeconfig temporal en memoria usando creds del provider (opcional):
+            # Como no usamos kubeconfig en Terraform, aquí solo mostramos estado con kubectl si ya tienes contexto configurado;
+            # si no lo tienes, puedes omitir este bloque o usar tu kubeconfig propio.
+            echo "Despliegue aplicado. Info del Service:"
+            kubectl -n "${NAMESPACE}" get svc || true
+            echo "Revision del Deployment:"
+            kubectl -n "${NAMESPACE}" rollout status deploy/${RELEASE_NAME} --timeout=60s || true
+          '''
+        }
       }
     }
   }
