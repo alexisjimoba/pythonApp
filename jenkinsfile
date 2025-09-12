@@ -2,144 +2,92 @@ pipeline {
   agent any
 
   options {
-    skipDefaultCheckout(true)
+    ansiColor('xterm')
     timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+  }
+
+  parameters {
+    choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción a ejecutar')
+    string(name: 'NAMESPACE', defaultValue: 'pythonapp', description: 'K8s namespace')
+    string(name: 'RELEASE_NAME', defaultValue: 'pythonapp', description: 'Nombre de release Helm')
+    string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repositorio de imagen')
+    string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Tag de imagen')
+    string(name: 'SERVICE_TYPE', defaultValue: 'NodePort', description: 'Tipo de Service')
+    string(name: 'NODE_PORT', defaultValue: '30080', description: 'NodePort')
+    booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
+    string(name: 'INGRESS_HOST', defaultValue: 'pythonapp.local', description: 'Host de Ingress')
+    string(name: 'REPLICAS', defaultValue: '1', description: 'Réplicas')
   }
 
   environment {
-    APP_NAME      = 'mi-servicio'
-    TF_WORKDIR    = 'infra/terraform'
-    TF_VAR_env    = 'dev'
-    TF_VAR_region = 'us-central1'
-
-    // bin local para instalar utilidades sin sudo
-    LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${LOCAL_BIN}:${PATH}"
-
-    // Sonar opcional
-    SONARQUBE_ENV = 'SonarQubeServer'
-    SONAR_PROJECT = 'org:mi-servicio'
+    // Necesitas un agente con Minikube, kubectl, Helm, Terraform y PowerShell
+    POWERSHELL = isUnix() ? 'pwsh' : 'powershell'
   }
 
   stages {
-
-    stage('Checkout') {
+    stage('Checkout infra repo') {
       steps {
-        ansiColor('xterm') {
-          checkout([$class: 'GitSCM',
-            branches: [[name: '*/main']],
-            userRemoteConfigs: [[ url: 'https://github.com/alexisjimoba/pythonApp.git' ]],
-            extensions: [
-              [$class: 'WipeWorkspace'],
-              [$class: 'CleanBeforeCheckout']
-            ]
-          ])
-          sh '''#!/bin/bash
-            set -euxo pipefail
-            echo "== Entorno ==" && printenv | sort
-          '''
+        checkout scm
+      }
+    }
+
+    stage('Preparar workspace') {
+      steps {
+        script {
+          // Asegurar rutas
+          env.PROJ_DIR = "${pwd()}"
+          echo "Workspace: ${env.PROJ_DIR}"
         }
       }
     }
 
-    stage('Setup Tooling') {
+    stage('Deploy') {
+      when { expression { params.ACTION == 'deploy' } }
       steps {
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
-            set -euxo pipefail
-
-            # --- Preparar binario local sin sudo ---
-            mkdir -p "${LOCAL_BIN}"
-
-            # 1) tfsec SIN sudo => descarga directa al bin local
-            #   - URL "latest" resuelve a la versión más reciente de GitHub Releases.
-            #   - Si el agente es arm64 cambia a tfsec-linux-arm64.
-            ARCH=$(uname -m)
-            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
-            else
-              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
-            fi
-            curl -fsSL "$TSEC_URL" -o "${LOCAL_BIN}/tfsec"
-            chmod +x "${LOCAL_BIN}/tfsec"
-            tfsec --version
-
-            # 2) Python venv + checkov
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install --upgrade pip
-            pip install checkov
-            checkov --version
-          '''
-        }
-      }
-    }
-
-    stage('Static Code Analysis: Terraform') {
-      steps {
-        ansiColor('xterm') {
-          sh '''#!/bin/bash
-            set -euxo pipefail
-            mkdir -p reports
-
-            # tfsec → SARIF + JSON (no rompe el build)
-            tfsec --soft-fail --format sarif --out reports/tfsec.sarif "${TF_WORKDIR}"
-            tfsec --soft-fail --format json  --out reports/tfsec.json  "${TF_WORKDIR}"
-
-            # checkov → SARIF + JUnit (no rompe el build)
-            source .venv/bin/activate
-            checkov -d "${TF_WORKDIR}" --soft-fail --output sarif    > reports/checkov.sarif
-            checkov -d "${TF_WORKDIR}" --soft-fail --output junitxml > reports/checkov.junit.xml
-          '''
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/*', fingerprint: true
-          junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          script {
-            try {
-              recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
-            } catch (err) {
-              echo "recordIssues/SARIF no disponible (¿falta plugin Warnings NG?): ${err}"
-            }
+        script {
+          withEnv([
+            "TF_VAR_namespace=${params.NAMESPACE}",
+            "TF_VAR_release_name=${params.RELEASE_NAME}",
+            "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
+            "TF_VAR_image_tag=${params.IMAGE_TAG}",
+            "TF_VAR_replicas=${params.REPLICAS}",
+            "TF_VAR_service_type=${params.SERVICE_TYPE}",
+            "TF_VAR_node_port=${params.NODE_PORT}",
+            "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
+            "TF_VAR_ingress_host=${params.INGRESS_HOST}"
+          ]) {
+            // Ejecuta script PowerShell que hace build + terraform apply
+            bat(label: 'Deploy (Windows)',
+                script: f'{POWERSHELL} -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\\scripts\\deploy.ps1" ' +
+                        f'-Namespace "{params.NAMESPACE}" -ReleaseName "{params.RELEASE_NAME}" ' +
+                        f'-ImageRepository "{params.IMAGE_REPOSITORY}" -ImageTag "{params.IMAGE_TAG}" ' +
+                        f'-Replicas {params.REPLICAS} -ServiceType "{params.SERVICE_TYPE}" ' +
+                        f'-NodePort {params.NODE_PORT} -IngressEnabled ${{params.INGRESS_ENABLED}} -IngressHost "{params.INGRESS_HOST}"'
+            )
           }
         }
       }
     }
 
-    stage('Optional: SonarQube') {
-      when { expression { fileExists('sonar-project.properties') } }
+    stage('Destroy') {
+      when { expression { params.ACTION == 'destroy' } }
       steps {
-        ansiColor('xterm') {
-          script {
-            try {
-              withSonarQubeEnv("${SONARQUBE_ENV}") {
-                sh '''#!/bin/bash
-                  set -euxo pipefail
-                  if command -v sonar-scanner >/dev/null 2>&1; then
-                    sonar-scanner -Dsonar.projectKey="${SONAR_PROJECT}"
-                  else
-                    echo "sonar-scanner no encontrado; omitiendo SonarQube"
-                  fi
-                '''
-              }
-            } catch (err) {
-              echo "SonarQube no configurado o plugin ausente: ${err}"
-            }
-          }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/*', fingerprint: true
+        dir('terraform') {
+          bat(label: 'Terraform Destroy',
+              script: f'{POWERSHELL} -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "terraform init; terraform destroy -auto-approve"')
         }
       }
     }
   }
 
   post {
-    success { echo "✅ Análisis estático completado." }
-    always  { echo "📦 Reportes en el directorio 'reports/'." }
+    success {
+      echo "Pipeline ${params.ACTION} completado."
+    }
+    failure {
+      echo "Pipeline ${params.ACTION} falló."
+    }
   }
 }
