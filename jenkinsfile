@@ -7,17 +7,20 @@ pipeline {
   }
 
   parameters {
-    choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
-    choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
+    choice(name: 'TF_ACTION', choices: ['init','plan','apply','destroy','none'], description: 'Acción de Terraform')
+    choice(name: 'TF_ENV',    choices: ['staging','production','local'], description: 'Ambiente para tfvars')
 
     // API server accesible desde el contenedor (Windows: host.docker.internal)
     string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal', description: 'Host del API server')
     string(name: 'API_SERVER_PORT', defaultValue: '49230', description: 'Puerto del API server')
 
-    // Registro donde se hará push
-    choice(name: 'REGISTRY', choices: ['docker.io', 'ghcr.io'], description: 'Registro de contenedores')
-    string(name: 'REPOSITORY', defaultValue: 'youruser/pythonapp', description: 'Repositorio (namespace/name). Ej: usuario/pythonapp')
-    string(name: 'DOCKER_CRED_ID', defaultValue: 'docker-cred', description: 'ID credencial de Jenkins para el registry')
+    // Registry local
+    string(name: 'REGISTRY_PUSH', defaultValue: 'localhost:5000', description: 'Registro para hacer push')
+    string(name: 'REGISTRY_PULL', defaultValue: 'host.minikube.internal:5000', description: 'Registro que usarán los Pods')
+    string(name: 'REPOSITORY',    defaultValue: 'pythonapp', description: 'Nombre del repo en el registry local (namespace/name o solo name)')
+
+    // Credenciales (opcionales). Si dejas vacío, no hace docker login.
+    string(name: 'DOCKER_CRED_ID', defaultValue: '', description: 'ID credencial para docker login (opcional)')
 
     // kubeconfig (credencial opcional o ruta montada en el contenedor)
     string(name: 'KUBE_CRED_ID',     defaultValue: '', description: 'ID credencial Secret file/text con kubeconfig (opcional)')
@@ -25,22 +28,20 @@ pipeline {
   }
 
   environment {
-    LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${WORKSPACE}/.bin:${PATH}"
+    LOCAL_BIN       = "${WORKSPACE}/.bin"
+    PATH            = "${WORKSPACE}/.bin:${PATH}"
+    TF_WORKDIR      = 'terraform'
+    TF_VERSION      = '1.6.6'
 
-    TF_WORKDIR    = 'terraform'
-    TF_VERSION    = '1.6.6'
+    // Vars Terraform comunes (ajústalas si las usas)
+    TF_VAR_env      = 'dev'
+    TF_VAR_region   = 'us-central1'
 
-    // Defaults Terraform (puedes ajustar)
-    TF_VAR_env    = 'dev'
-    TF_VAR_region = 'us-central1'
-
-    // Donde copiaremos el kubeconfig para Terraform
+    // kubeconfig destino dentro del workspace
     KUBECONFIG_PATH = "${WORKSPACE}/.kube/config"
   }
 
   stages {
-
     stage('Checkout') {
       steps {
         checkout scm
@@ -52,40 +53,149 @@ pipeline {
       steps {
         sh '''
           set -eu
+          command -v docker
           docker version
           echo "OK: docker CLI y socket disponibles."
         '''
       }
     }
 
-    stage('Build & Tag Image') {
+    stage('Build & Push to Local Registry') {
       steps {
         script {
-          // Tag con SHA corto; si falla usa BUILD_NUMBER
           def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD || echo latest').trim()
-          env.IMAGE_TAG  = sha
-          env.IMAGE_NAME_LOCAL  = "pythonapp:${IMAGE_TAG}"
-          env.IMAGE_NAME_REMOTE = "${params.REGISTRY}/${params.REPOSITORY}:${IMAGE_TAG}"
+          env.IMAGE_TAG           = sha
+          env.IMAGE_LOCAL         = "pythonapp:${IMAGE_TAG}"
+          env.IMAGE_LOCALHOST     = "${params.REGISTRY_PUSH}/${params.REPOSITORY}:${IMAGE_TAG}"
+          env.IMAGE_MINIKUBEHOST  = "${params.REGISTRY_PULL}/${params.REPOSITORY}:${IMAGE_TAG}"
         }
+
+        // login opcional si hay credenciales
+        script {
+          if (params.DOCKER_CRED_ID?.trim()) {
+            withCredentials([usernamePassword(credentialsId: params.DOCKER_CRED_ID, usernameVariable: 'DO_USER', passwordVariable: 'DO_PASS')]) {
+              sh '''
+                set -eu
+                echo "$DO_PASS" | docker login "${REGISTRY_PUSH}" -u "$DO_USER" --password-stdin || true
+                echo "$DO_PASS" | docker login "${REGISTRY_PULL}" -u "$DO_USER" --password-stdin || true
+              '''
+            }
+          }
+        }
+
         sh '''
           set -eu
-          echo "🔨 Construyendo imagen ${IMAGE_NAME_LOCAL}..."
-          docker build -t "${IMAGE_NAME_LOCAL}" application
-          docker tag "${IMAGE_NAME_LOCAL}" "${IMAGE_NAME_REMOTE}"
+          echo "🔨 Build ${IMAGE_LOCAL}..."
+          docker build -t "${IMAGE_LOCAL}" application
+
+          echo "🏷️  Tagging..."
+          docker tag "${IMAGE_LOCAL}" "${IMAGE_LOCALHOST}"
+          docker tag "${IMAGE_LOCAL}" "${IMAGE_MINIKUBEHOST}"
+
+          echo "📤 Push..."
+          docker push "${IMAGE_LOCALHOST}"
+          docker push "${IMAGE_MINIKUBEHOST}"
         '''
       }
     }
 
-    stage('Login & Push Image') {
+    stage('Setup Tooling (sin apt)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: params.DOCKER_CRED_ID, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          sh '''
-            set -eu
-            echo "$DOCKER_PASS" | docker login "${REGISTRY}" -u "$DOCKER_USER" --password-stdin
-            echo "📤 Pushing ${IMAGE_NAME_REMOTE}..."
-            docker push "${IMAGE_NAME_REMOTE}"
-            docker logout "${REGISTRY}" || true
-          '''
+        sh '''
+          set -eu
+          mkdir -p "${LOCAL_BIN}"
+
+          dl() { URL="$1"; OUT="$2";
+            if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
+            elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
+            else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi; }
+
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+            TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
+            TERRAFORM_ARCH="amd64"
+            CKV_ZIP="checkov_linux_X86_64.zip"
+          else
+            TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
+            TERRAFORM_ARCH="arm64"
+            CKV_ZIP="checkov_linux_arm64.zip"
+          fi
+
+          # tfsec
+          ( dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" && "${LOCAL_BIN}/tfsec" --version ) || echo "⚠️ tfsec no disponible"
+
+          # Terraform (zip) con 'jar'
+          TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
+          if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
+            rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
+            mv .tfzip/terraform "${LOCAL_BIN}/terraform" || true
+            rm -rf .tfzip "$TF_ZIP"
+            chmod +x "${LOCAL_BIN}/terraform" || true
+            "${LOCAL_BIN}/terraform" -version || true
+          else
+            echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
+          fi
+
+          # Checkov (best-effort)
+          if command -v python3 >/dev/null 2>&1; then
+            python3 -m pip install --no-cache-dir --upgrade pip || true
+            python3 -m pip install --no-cache-dir --user checkov || true
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+          if ! command -v checkov >/dev/null 2>&1; then
+            if command -v jar >/dev/null 2>&1; then
+              if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
+                rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
+                CKV_BIN="$(find .ckvzip -type f -name checkov | head -n 1 || true)"
+                [ -n "${CKV_BIN}" ] && mv "${CKV_BIN}" "${LOCAL_BIN}/checkov" && chmod +x "${LOCAL_BIN}/checkov" || true
+                rm -rf .ckvzip "$CKV_ZIP"
+              fi
+            fi
+          fi
+          if [ -x "${LOCAL_BIN}/checkov" ]; then
+            "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || { echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
+          fi
+        '''
+      }
+    }
+
+    stage('Static Code Analysis: Terraform') {
+      steps {
+        sh '''
+          set -eu
+          mkdir -p reports
+          TARGET="${TF_WORKDIR}"
+          if [ ! -d "${TARGET}" ]; then
+            if   [ -d "terraform" ];       then TARGET="terraform";
+            elif [ -d "infra/terraform" ]; then TARGET="infra/terraform";
+            else TARGET="."; fi
+          fi
+
+          if command -v terraform >/dev/null 2>&1; then
+            terraform -chdir="${TARGET}" init -backend=false -upgrade || true
+            terraform -chdir="${TARGET}" validate || true
+          fi
+
+          if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
+            echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
+            exit 0
+          fi
+
+          echo "🔎 Escaneando Terraform en: ${TARGET}"
+          command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}" || true
+          command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}" || true
+          if command -v checkov >/dev/null 2>&1; then
+            checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
+            checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
+          else
+            echo "ℹ️ Checkov no disponible en este entorno; solo se ejecutó tfsec."
+          fi
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/*', fingerprint: true
+          junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
         }
       }
     }
@@ -93,7 +203,7 @@ pipeline {
     stage('Prepare Kubeconfig (TLS best-effort)') {
       steps {
         script {
-          def runPrep = { String kubePath ->
+          def prep = { String kubePath ->
             withEnv(["KC_PATH=${kubePath}"]) {
               sh '''
                 set -eu
@@ -110,7 +220,6 @@ pipeline {
                   sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  insecure-skip-tls-verify: true' "${KUBECONFIG_PATH}"
 
                 export KUBECONFIG="${KUBECONFIG_PATH}"
-                echo "Ping API server..."
                 curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null
               '''
             }
@@ -120,49 +229,81 @@ pipeline {
           if (params.KUBE_CRED_ID?.trim()) {
             try {
               withCredentials([file(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_FILE')]) {
-                runPrep(KCF_FILE); used = true
+                prep(KCF_FILE); used = true
               }
             } catch (ignore) {}
             if (!used) {
               withCredentials([string(credentialsId: params.KUBE_CRED_ID, variable: 'KCF_TEXT')]) {
                 def kcPath = "${WORKSPACE}/.kube/kubeconfig_from_secret_text"
                 writeFile file: kcPath, text: KCF_TEXT
-                runPrep(kcPath); used = true
+                prep(kcPath); used = true
               }
             }
           }
           if (!used) {
-            runPrep(params.KUBE_CONFIG_PATH)
+            prep(params.KUBE_CONFIG_PATH)
           }
         }
       }
     }
 
-    stage('Terraform Init/Plan/Apply') {
+    stage('Terraform (init/plan/apply/destroy)') {
       when { expression { params.TF_ACTION != 'none' } }
       steps {
         script {
-          // Pasamos repo/tag reales a Terraform → Helm usará esta imagen
-          env.TF_VAR_image_repository = "${params.REGISTRY}/${params.REPOSITORY}"
-          env.TF_VAR_image_tag        = "${env.IMAGE_TAG}"
+          // Pasar repo/tag reales a Terraform → Helm usará esta imagen
+          env.TF_VAR_image_repository = "${params.REGISTRY_PULL}/${params.REPOSITORY}"
+          env.TF_VAR_image_tag        = env.IMAGE_TAG
         }
         dir("${TF_WORKDIR}") {
           sh '''
             set -eu
-            terraform init -upgrade
-            terraform validate
-            terraform plan -out=tfplan
-            if [ "${TF_ACTION}" = "apply" ]; then
-              terraform apply -auto-approve tfplan
+            if ! command -v terraform >/dev/null 2>&1; then
+              echo "❌ Terraform CLI no disponible."; exit 1; fi
+
+            TARGET="."
+            echo "📁 Dir: ${PWD} | ⚙️ Acción: ${TF_ACTION}"
+
+            terraform -chdir="${TARGET}" init -input=false -upgrade
+
+            if [ "${TF_ACTION}" = "init" ]; then
+              echo "✅ Terraform init listo."
+              exit 0
             fi
+
+            # tfvars por ambiente si existe
+            TFVARS=""
+            if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+              TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+            fi
+
+            if [ "${TF_ACTION}" = "destroy" ]; then
+              terraform -chdir="${TARGET}" destroy -input=false -auto-approve ${TFVARS}
+              exit 0
+            fi
+
+            terraform -chdir="${TARGET}" validate
+            terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+
+            if [ "${TF_ACTION}" = "apply" ]; then
+              terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+            fi
+
+            # Artefacto útil
+            terraform -chdir="${TARGET}" show -json tfplan > "${WORKSPACE}/reports/tfplan.json" || true
           '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/tfplan.json', fingerprint: true, onlyIfSuccessful: false
         }
       }
     }
   }
 
   post {
-    success { echo "✅ Pipeline OK. Imagen publicada y Terraform ${params.TF_ACTION} listo." }
-    failure { echo "❌ Fallo en el pipeline." }
+    success { echo "✅ Pipeline OK (TF_ACTION=${params.TF_ACTION}). Imagen publicada y chart desplegado." }
+    always  { echo "📦 Reportes en 'reports/' (si hubo análisis/plan)." }
   }
 }
