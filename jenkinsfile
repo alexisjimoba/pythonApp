@@ -1,93 +1,203 @@
 pipeline {
-  agent any
+  agent {
+    docker {
+      image 'python:3.11-slim'
+      args '-u root'
+    }
+  }
 
   options {
-    ansiColor('xterm')
     timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '10'))
+    skipDefaultCheckout(true)
   }
 
   parameters {
-    choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción a ejecutar')
-    string(name: 'NAMESPACE', defaultValue: 'pythonapp', description: 'K8s namespace')
-    string(name: 'RELEASE_NAME', defaultValue: 'pythonapp', description: 'Nombre de release Helm')
-    string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repositorio de imagen')
-    string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'Tag de imagen')
-    string(name: 'SERVICE_TYPE', defaultValue: 'NodePort', description: 'Tipo de Service')
-    string(name: 'NODE_PORT', defaultValue: '30080', description: 'NodePort')
-    booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
-    string(name: 'INGRESS_HOST', defaultValue: 'pythonapp.local', description: 'Host de Ingress')
-    string(name: 'REPLICAS', defaultValue: '1', description: 'Réplicas')
+    choice(name: 'TF_ACTION', choices: ['plan', 'apply', 'none'], description: 'Acción de Terraform')
+    choice(name: 'TF_ENV',    choices: ['staging', 'production', 'local'], description: 'Ambiente para tfvars')
   }
 
   environment {
-    // Necesitas un agente con Minikube, kubectl, Helm, Terraform y PowerShell
-    POWERSHELL = isUnix() ? 'pwsh' : 'powershell'
+    // Rutas y PATH local para binarios sin sudo
+    LOCAL_BIN   = "${WORKSPACE}/.bin"
+    PATH        = "${LOCAL_BIN}:${PATH}"
+
+    // Terraform
+    TF_WORKDIR  = 'terraform'
+    TF_VERSION  = '1.6.6' // cámbialo si quieres otra versión
+
+    // Variables de ejemplo
+    TF_VAR_env    = 'dev'
+    TF_VAR_region = 'us-central1'
   }
 
   stages {
-    stage('Checkout infra repo') {
+
+    stage('Bootstrap container deps') {
       steps {
-        checkout scm
+        sh '''#!/bin/bash
+          set -euxo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates bash unzip
+          rm -rf /var/lib/apt/lists/*
+        '''
       }
     }
 
-    stage('Preparar workspace') {
+    stage('Checkout') {
       steps {
-        script {
-          // Asegurar rutas
-          env.PROJ_DIR = "${pwd()}"
-          echo "Workspace: ${env.PROJ_DIR}"
+        // Si tu job NO es multibranch, reemplaza por:
+        // git branch: 'main', url: 'https://github.com/<org>/<repo>.git'
+        checkout scm
+        ansiColor('xterm') {
+          sh '''#!/bin/bash
+            set -euxo pipefail
+            echo "== Entorno ==" && printenv | sort
+            git --version || true
+            python3 --version || true
+          '''
         }
       }
     }
 
-    stage('Deploy') {
-      when { expression { params.ACTION == 'deploy' } }
+    stage('Setup Tooling (tfsec / checkov / terraform)') {
       steps {
-        script {
-          withEnv([
-            "TF_VAR_namespace=${params.NAMESPACE}",
-            "TF_VAR_release_name=${params.RELEASE_NAME}",
-            "TF_VAR_image_repository=${params.IMAGE_REPOSITORY}",
-            "TF_VAR_image_tag=${params.IMAGE_TAG}",
-            "TF_VAR_replicas=${params.REPLICAS}",
-            "TF_VAR_service_type=${params.SERVICE_TYPE}",
-            "TF_VAR_node_port=${params.NODE_PORT}",
-            "TF_VAR_ingress_enabled=${params.INGRESS_ENABLED}",
-            "TF_VAR_ingress_host=${params.INGRESS_HOST}"
-          ]) {
-            // Ejecuta script PowerShell que hace build + terraform apply
-            bat(label: 'Deploy (Windows)',
-                script: f'{POWERSHELL} -NoLogo -NoProfile -ExecutionPolicy Bypass -File ".\\scripts\\deploy.ps1" ' +
-                        f'-Namespace "{params.NAMESPACE}" -ReleaseName "{params.RELEASE_NAME}" ' +
-                        f'-ImageRepository "{params.IMAGE_REPOSITORY}" -ImageTag "{params.IMAGE_TAG}" ' +
-                        f'-Replicas {params.REPLICAS} -ServiceType "{params.SERVICE_TYPE}" ' +
-                        f'-NodePort {params.NODE_PORT} -IngressEnabled ${{params.INGRESS_ENABLED}} -IngressHost "{params.INGRESS_HOST}"'
-            )
+        ansiColor('xterm') {
+          sh '''#!/bin/bash
+            set -euxo pipefail
+            mkdir -p "${LOCAL_BIN}"
+
+            # --- tfsec (amd64/arm64) ---
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
+              TERRAFORM_ARCH="amd64"
+            else
+              TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-arm64"
+              TERRAFORM_ARCH="arm64"
+            fi
+            curl -fsSL "$TSEC_URL" -o "${LOCAL_BIN}/tfsec"
+            chmod +x "${LOCAL_BIN}/tfsec"
+            tfsec --version
+
+            # --- Terraform (sin sudo) ---
+            TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
+            curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" -o "$TF_ZIP"
+            unzip -o "$TF_ZIP" -d "${LOCAL_BIN}"
+            rm -f "$TF_ZIP"
+            terraform -version
+
+            # --- venv + checkov ---
+            python3 -m venv .venv
+            source .venv/bin/activate
+            pip install --upgrade pip
+            pip install checkov
+            checkov --version
+          '''
+        }
+      }
+    }
+
+    stage('Static Code Analysis: Terraform') {
+      steps {
+        ansiColor('xterm') {
+          sh '''#!/bin/bash
+            set -euxo pipefail
+            mkdir -p reports
+
+            # Autodetección de carpeta con .tf
+            TARGET="${TF_WORKDIR}"
+            if [ ! -d "${TARGET}" ]; then
+              if   [ -d "terraform" ];       then TARGET="terraform"
+              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+              else TARGET="."; fi
+            fi
+
+            if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
+              echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
+              exit 0
+            fi
+
+            echo "🔎 Escaneando Terraform en: ${TARGET}"
+            tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}"
+            tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}"
+            source .venv/bin/activate
+            checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif
+            checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml
+          '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/*', fingerprint: true
+          junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
+          script {
+            try {
+              recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
+            } catch (err) {
+              echo "recordIssues/SARIF no disponible (Warnings NG no instalado?): ${err}"
+            }
           }
         }
       }
     }
 
-    stage('Destroy') {
-      when { expression { params.ACTION == 'destroy' } }
+    stage('Terraform Init/Plan/Apply') {
+      when { expression { params.TF_ACTION != 'none' } }
       steps {
-        dir('terraform') {
-          bat(label: 'Terraform Destroy',
-              script: f'{POWERSHELL} -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "terraform init; terraform destroy -auto-approve"')
+        ansiColor('xterm') {
+          sh '''#!/bin/bash
+            set -euxo pipefail
+
+            # Selección de carpeta
+            TARGET="${TF_WORKDIR}"
+            if [ ! -d "${TARGET}" ]; then
+              if   [ -d "terraform" ];       then TARGET="terraform"
+              elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
+              else
+                echo "❌ No se encontró directorio Terraform. Abortando stage."
+                exit 1
+              fi
+            fi
+
+            # tfvars del ambiente (si existe)
+            TFVARS=""
+            if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
+              TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
+            fi
+
+            echo "📁 Directorio: ${TARGET}"
+            echo "🌱 Ambiente: ${TF_ENV}"
+            echo "⚙️  Acción: ${TF_ACTION}"
+
+            # Init / Validate
+            terraform -chdir="${TARGET}" init -input=false -upgrade
+            terraform -chdir="${TARGET}" validate
+
+            # Si no hay credenciales AWS, avisa temprano (para evitar errores poco claros)
+            if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+              echo "⚠️  AWS creds no presentes en el entorno. Si el provider AWS requiere acceso, plan/apply fallarán."
+            fi
+
+            # Plan
+            if [ "${TF_ACTION}" = "plan" ] || [ "${TF_ACTION}" = "apply" ]; then
+              terraform -chdir="${TARGET}" plan -input=false ${TFVARS} -out=tfplan
+            fi
+
+            # Apply (protegido por TF_ACTION)
+            if [ "${TF_ACTION}" = "apply" ]; then
+              # Puedes pedir confirmación manual con 'input' si quieres:
+              # echo "Esperando confirmación para aplicar..." ; sleep 10
+              terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
+            fi
+          '''
         }
       }
     }
   }
 
   post {
-    success {
-      echo "Pipeline ${params.ACTION} completado."
-    }
-    failure {
-      echo "Pipeline ${params.ACTION} falló."
-    }
+    success { echo "✅ Pipeline OK (incluye Terraform ${params.TF_ACTION})." }
+    always  { echo "📦 Reportes en 'reports/' (si hubo análisis)." }
   }
 }
