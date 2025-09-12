@@ -1,29 +1,28 @@
 ############################################
 # main.tf — Providers (kube + helm)
-# - Jenkins inyecta TF_VAR_kubeconfig_path con la
-#   ruta del kubeconfig (credencial Secret file).
-# - Para uso local, por defecto usa ~/.kube/config
+# Jenkins puede inyectar TF_VAR_kubeconfig_path.
+# Localmente, por defecto usa "~/.kube/config".
 ############################################
 
 variable "kubeconfig_path" {
   type        = string
   description = "Ruta al kubeconfig a usar por los providers"
-  default     = pathexpand("~/.kube/config")
+  default     = "~/.kube/config"   # ← literal; sin funciones aquí
 }
 
 # Provider de Kubernetes
 provider "kubernetes" {
-  config_path = var.kubeconfig_path
+  # Aquí sí podemos usar funciones
+  config_path = pathexpand(var.kubeconfig_path)
 }
 
 # Provider de Helm (usa el mismo kubeconfig)
 provider "helm" {
   kubernetes {
-    config_path = var.kubeconfig_path
+    config_path = pathexpand(var.kubeconfig_path)
   }
 }
 
 # Nota:
-# - No declares aquí 'terraform { required_providers { ... } }'.
-#   Eso debe vivir en versions.tf para evitar duplicados.
-# - Los recursos (namespace, helm_release, etc.) van en otros .tf (p.ej. k8s.tf).
+# - 'required_providers' debe estar solo en versions.tf
+# - Recursos (ns, helm_release, etc.) en otros .tf (p.ej. k8s.tf)
