@@ -94,15 +94,16 @@ pipeline {
             fi
 
             # --- Checkov ---
+            # 1) Si hay Python, intentamos pip (mejor compatibilidad)
             if command -v python3 >/dev/null 2>&1; then
               python3 -m pip install --no-cache-dir --upgrade pip || true
               python3 -m pip install --no-cache-dir --user checkov || true
-              # agregar bin de usuario a PATH por si acaso
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
 
+            # 2) Si no quedó disponible, probamos binario ZIP
             if ! command -v checkov >/dev/null 2>&1; then
-              echo "ℹ️ Instalando Checkov como binario (sin Python)"
+              echo "ℹ️ Intentando Checkov como binario (sin Python)"
               if command -v jar >/dev/null 2>&1; then
                 if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
                   rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
@@ -117,6 +118,21 @@ pipeline {
                 fi
               else
                 echo "⚠️ No hay 'jar' para extraer el ZIP de Checkov."
+              fi
+            fi
+
+            # 3) Si el binario existe pero falla por GLIBC, lo deshabilitamos
+            if [ -x "${LOCAL_BIN}/checkov" ]; then
+              if ! "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1; then
+                ERR="$("${LOCAL_BIN}/checkov" --version 2>&1 || true)"
+                echo "$ERR" || true
+                if echo "$ERR" | grep -q 'GLIBC_2\\.38'; then
+                  echo "⚠️ GLIBC del contenedor es antigua; deshabilitando Checkov (usaremos solo tfsec)."
+                  rm -f "${LOCAL_BIN}/checkov"
+                else
+                  echo "⚠️ Checkov no ejecuta; se omitirá."
+                  rm -f "${LOCAL_BIN}/checkov" || true
+                fi
               fi
             fi
 
@@ -158,8 +174,12 @@ pipeline {
             echo "🔎 Escaneando Terraform en: ${TARGET}"
             command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format sarif --out reports/tfsec.sarif "${TARGET}" || true
             command -v tfsec   >/dev/null 2>&1 && tfsec   --soft-fail --format json  --out reports/tfsec.json  "${TARGET}" || true
-            command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
-            command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
+            if command -v checkov >/dev/null 2>&1; then
+              checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
+              checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
+            else
+              echo "ℹ️ Checkov no disponible en este entorno; solo se ejecutó tfsec."
+            fi
           '''
           try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
