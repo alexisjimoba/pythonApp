@@ -13,10 +13,9 @@ pipeline {
 
   environment {
     LOCAL_BIN     = "${WORKSPACE}/.bin"
-    PATH          = "${WORKSPACE}/.bin:${PATH}"  // prefijo directo, sin depender del orden
+    PATH          = "${WORKSPACE}/.bin:${PATH}"
     TF_WORKDIR    = 'terraform'
     TF_VERSION    = '1.6.6'
-
     TF_VAR_env    = 'dev'
     TF_VAR_region = 'us-central1'
   }
@@ -36,11 +35,7 @@ pipeline {
             which jar  || true
             which python3 || true
           '''
-          try {
-            ansiColor('xterm') { sh cmd }
-          } catch (ignored) {
-            sh cmd
-          }
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
       }
     }
@@ -52,15 +47,11 @@ pipeline {
             set -euxo pipefail
             mkdir -p "${LOCAL_BIN}"
 
-            # helper descarga (curl o wget)
-            dl() {
-              URL="$1"; OUT="$2"
-              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT"
-              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL"
-              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi
-            }
+            dl() { URL="$1"; OUT="$2";
+              if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$OUT";
+              elif command -v wget >/dev/null 2>&1; then wget -qO "$OUT" "$URL";
+              else echo "❌ No hay curl ni wget. Imposible descargar $URL"; return 1; fi; }
 
-            # tfsec (amd64/arm64)
             ARCH=$(uname -m)
             if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
               TSEC_URL="https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-linux-amd64"
@@ -76,7 +67,7 @@ pipeline {
             dl "$TSEC_URL" "${LOCAL_BIN}/tfsec" && chmod +x "${LOCAL_BIN}/tfsec" || true
             tfsec --version || echo "⚠️ tfsec no disponible"
 
-            # Terraform (zip) → extraer con 'jar' (incluido con Java/Jenkins)
+            # Terraform (extraer con 'jar')
             TF_ZIP="terraform_${TF_VERSION}_linux_${TERRAFORM_ARCH}.zip"
             if dl "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}" "$TF_ZIP" && command -v jar >/dev/null 2>&1; then
               rm -rf .tfzip && mkdir .tfzip && (cd .tfzip && jar xf "../$TF_ZIP")
@@ -88,7 +79,7 @@ pipeline {
             fi
             terraform -version || echo "⚠️ terraform no disponible"
 
-            # checkov por pip si hay python3; si no, binario
+            # checkov (pip si hay python3; si no, binario)
             if command -v python3 >/dev/null 2>&1; then
               python3 -m pip install --no-cache-dir --upgrade pip || true
               python3 -m pip install --no-cache-dir checkov || true
@@ -97,11 +88,7 @@ pipeline {
             fi
             checkov --version || echo "⚠️ checkov no disponible"
           '''
-          try {
-            ansiColor('xterm') { sh cmd }
-          } catch (ignored) {
-            sh cmd
-          }
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
       }
     }
@@ -113,7 +100,6 @@ pipeline {
             set -euxo pipefail
             mkdir -p reports
 
-            # Detecta carpeta con .tf
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
@@ -121,13 +107,12 @@ pipeline {
               else TARGET="."; fi
             fi
 
-            # validate temprano (si hay Terraform CLI)
+            # validate temprano (si hay Terraform)
             if command -v terraform >/dev/null 2>&1; then
               terraform -chdir="${TARGET}" init -backend=false -upgrade || true
               terraform -chdir="${TARGET}" validate || true
             fi
 
-            # ¿hay *.tf?
             if ! find "${TARGET}" -type f -name '*.tf' -print -quit | grep -q . ; then
               echo "⏭️  No hay archivos Terraform en ${TARGET}. Saltando escaneo IaC."
               exit 0
@@ -139,24 +124,15 @@ pipeline {
             command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output sarif    > reports/checkov.sarif || true
             command -v checkov >/dev/null 2>&1 && checkov -d "${TARGET}" --soft-fail --output junitxml > reports/checkov.junit.xml || true
           '''
-          try {
-            ansiColor('xterm') { sh cmd }
-          } catch (ignored) {
-            sh cmd
-          }
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
       }
       post {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          script {
-            try {
-              recordIssues enabledForFailure: true, tools: [sarif(pattern: 'reports/*.sarif')]
-            } catch (err) {
-              echo "recordIssues/SARIF no disponible (¿Warnings NG no instalado?): ${err}"
-            }
-          }
+          // Nota: para ver SARIF en UI instala "Warnings Next Generation" (warnings-ng)
+          echo "ℹ️ Para ver SARIF en Jenkins, instala el plugin 'Warnings Next Generation' y usa recordIssues + sarif()."
         }
       }
     }
@@ -173,18 +149,13 @@ pipeline {
               exit 1
             fi
 
-            # Selección de carpeta Terraform
             TARGET="${TF_WORKDIR}"
             if [ ! -d "${TARGET}" ]; then
               if   [ -d "terraform" ];       then TARGET="terraform"
               elif [ -d "infra/terraform" ]; then TARGET="infra/terraform"
-              else
-                echo "❌ No se encontró directorio Terraform. Abortando stage."
-                exit 1
-              fi
+              else echo "❌ No se encontró directorio Terraform."; exit 1; fi
             fi
 
-            # tfvars por ambiente si existe
             TFVARS=""
             if [ -f "${TARGET}/environments/${TF_ENV}/terraform.tfvars" ]; then
               TFVARS="-var-file=environments/${TF_ENV}/terraform.tfvars"
@@ -197,7 +168,6 @@ pipeline {
             terraform -chdir="${TARGET}" init -input=false -upgrade
             terraform -chdir="${TARGET}" validate
 
-            # Aviso si no hay credenciales AWS
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
               echo "⚠️  AWS creds no presentes: plan/apply podrían fallar si el provider las requiere."
             fi
@@ -210,11 +180,7 @@ pipeline {
               terraform -chdir="${TARGET}" apply -input=false -auto-approve tfplan
             fi
           '''
-          try {
-            ansiColor('xterm') { sh cmd }
-          } catch (ignored) {
-            sh cmd
-          }
+          try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
       }
     }
