@@ -13,7 +13,7 @@ pipeline {
     // 👉 Windows + Docker Desktop: apunta al host de Windows visto desde el contenedor
     string(name: 'API_SERVER_HOST', defaultValue: 'host.docker.internal',
            description: 'Host del API server (Windows: host.docker.internal)')
-    // Usa el puerto real de tu kubeconfig (p.ej. 49230). Si cambia, actualízalo al lanzar el build.
+    // Usa el puerto real de tu kubeconfig (ej. 49230). Si cambia, actualízalo al lanzar el build.
     string(name: 'API_SERVER_PORT', defaultValue: '49230',
            description: 'Puerto del API server (desde kubeconfig del host)')
 
@@ -101,56 +101,30 @@ pipeline {
               echo "⚠️ No se pudo extraer Terraform (falta jar o descarga falló)."
             fi
 
-            # --- Checkov ---
-            # 1) Si hay Python, intentamos pip (mejor compatibilidad)
+            # --- Checkov (opcional) ---
             if command -v python3 >/dev/null 2>&1; then
               python3 -m pip install --no-cache-dir --upgrade pip || true
               python3 -m pip install --no-cache-dir --user checkov || true
               export PATH="${HOME}/.local/bin:${PATH}"
             fi
-
-            # 2) Si no quedó disponible, probamos binario ZIP (puede fallar por GLIBC)
             if ! command -v checkov >/dev/null 2>&1; then
               echo "ℹ️ Intentando Checkov como binario (sin Python)"
               if command -v jar >/dev/null 2>&1; then
                 if dl "https://github.com/bridgecrewio/checkov/releases/latest/download/${CKV_ZIP}" "$CKV_ZIP"; then
                   rm -rf .ckvzip && mkdir .ckvzip && (cd .ckvzip && jar xf "../$CKV_ZIP")
                   CKV_BIN="$(find .ckvzip -type f -name checkov | head -n 1 || true)"
-                  if [ -n "${CKV_BIN}" ]; then
-                    mv "${CKV_BIN}" "${LOCAL_BIN}/checkov"
-                    chmod +x "${LOCAL_BIN}/checkov"
-                  fi
+                  [ -n "${CKV_BIN}" ] && mv "${CKV_BIN}" "${LOCAL_BIN}/checkov" && chmod +x "${LOCAL_BIN}/checkov" || true
                   rm -rf .ckvzip "$CKV_ZIP"
-                else
-                  echo "⚠️ Descarga de Checkov (GitHub) falló."
                 fi
-              else
-                echo "⚠️ No hay 'jar' para extraer el ZIP de Checkov."
               fi
             fi
-
-            # 3) Si el binario existe pero falla por GLIBC, lo deshabilitamos
             if [ -x "${LOCAL_BIN}/checkov" ]; then
               "${LOCAL_BIN}/checkov" --version >/dev/null 2>&1 || {
-                ERR="$( ${LOCAL_BIN}/checkov --version 2>&1 || true )"
-                echo "$ERR" || true
-                echo "$ERR" | grep -q 'GLIBC_2\\.38' && {
-                  echo "⚠️ GLIBC antigua; deshabilitando Checkov (solo tfsec)."
-                  rm -f "${LOCAL_BIN}/checkov"
-                } || {
-                  echo "⚠️ Checkov no ejecuta; se omitirá."
-                  rm -f "${LOCAL_BIN}/checkov" || true
-                }
-              }
+                echo "⚠️ Checkov no ejecuta; se omitirá."; rm -f "${LOCAL_BIN}/checkov" || true; }
             fi
 
-            echo "== Binarios instalados =="
-            ls -l "${LOCAL_BIN}" || true
-            if command -v checkov >/dev/null 2>&1; then
-              checkov --version
-            else
-              echo "ℹ️ checkov no disponible"
-            fi
+            echo "== Binarios instalados =="; ls -l "${LOCAL_BIN}" || true
+            command -v checkov >/dev/null 2>&1 && checkov --version || echo "ℹ️ checkov no disponible"
           '''
           try { ansiColor('xterm') { sh cmd } } catch (ignored) { sh cmd }
         }
@@ -171,7 +145,6 @@ pipeline {
               else TARGET="."; fi
             fi
 
-            # Validación ligera (si hay Terraform)
             if command -v terraform >/dev/null 2>&1; then
               terraform -chdir="${TARGET}" init -backend=false -upgrade || true
               terraform -chdir="${TARGET}" validate || true
@@ -199,7 +172,6 @@ pipeline {
         always {
           archiveArtifacts artifacts: 'reports/*', fingerprint: true
           junit testResults: 'reports/checkov.junit.xml', allowEmptyResults: true
-          echo "ℹ️ Para ver SARIF en Jenkins, instala 'Warnings Next Generation'."
         }
       }
     }
@@ -221,14 +193,17 @@ pipeline {
                 API_URL="https://${API_SERVER_HOST}:${API_SERVER_PORT}"
                 sed -E 's#^([[:space:]]*server:[[:space:]]*).*$#\\1'"${API_URL}"'#' -i "${TF_VAR_kubeconfig_path}"
 
-                # ---- DESACTIVAR validación TLS (solo CI): usar insecure-skip-tls-verify
-                # 1) Elimina cualquier certificate-authority / certificate-authority-data
-                sed -E -i '/^[[:space:]]*certificate-authority(-data)?:/d' "${TF_VAR_kubeconfig_path}"
-                # 2) Inserta insecure-skip-tls-verify: true debajo de server: si no existe
-                grep -q '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || \
-                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  insecure-skip-tls-verify: true' "${TF_VAR_kubeconfig_path}"
+                # ---- TLS correcto (sin desactivar CA):
+                # 1) Elimina cualquier 'insecure-skip-tls-verify' previo
+                sed -E -i '/^[[:space:]]*insecure-skip-tls-verify:/d' "${TF_VAR_kubeconfig_path}"
+                # 2) Añade/actualiza SNI para que el cert del apiserver (incluye "localhost") valide bien
+                if grep -q '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}"; then
+                  sed -E -i 's#^([[:space:]]*tls-server-name:).*$#\\1 localhost#' "${TF_VAR_kubeconfig_path}"
+                else
+                  sed -E -i '/^[[:space:]]*server:[[:space:]]*https?:\\/\\//a\\  tls-server-name: localhost' "${TF_VAR_kubeconfig_path}"
+                fi
 
-                # Preflight de conectividad (falla rápido si no hay acceso)
+                # Preflight de conectividad (reachability, sin validar cert)
                 if command -v curl >/dev/null 2>&1; then
                   curl -4 -k -m 5 -sS "${API_URL}/version" >/dev/null || {
                     echo "❌ No hay conectividad al API server ${API_URL} desde el contenedor"; exit 1; }
@@ -236,9 +211,9 @@ pipeline {
 
                 export KUBECONFIG="${TF_VAR_kubeconfig_path}"
                 export KUBE_CONFIG_PATH="${TF_VAR_kubeconfig_path}"
-                echo "🔗 API server final en kubeconfig:"
+                echo "🔗 Entradas kubeconfig:"
                 grep -m1 '^[[:space:]]*server:' "${TF_VAR_kubeconfig_path}" || true
-                grep -m1 '^[[:space:]]*insecure-skip-tls-verify:' "${TF_VAR_kubeconfig_path}" || true
+                grep -m1 '^[[:space:]]*tls-server-name:' "${TF_VAR_kubeconfig_path}" || true
 
                 TARGET="${TF_WORKDIR}"
                 if [ ! -d "${TARGET}" ]; then
