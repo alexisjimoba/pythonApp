@@ -2,37 +2,34 @@ pipeline {
   agent any
 
   options {
-    ansiColor('xterm')
-    timestamps()
-    disableConcurrentBuilds()
+    ansiColor('xterm'); timestamps(); disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '15'))
   }
 
   parameters {
-    choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción a ejecutar')
+    choice(name: 'ACTION', choices: ['deploy', 'destroy'], description: 'Acción')
     // Imagen YA existente (no se construye aquí)
-    string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repo de la imagen (por ej. registry/myproj/pythonapp)')
+    string(name: 'IMAGE_REPOSITORY', defaultValue: 'pythonapp', description: 'Repo de la imagen (registry/myproj/pythonapp)')
     string(name: 'IMAGE_TAG',        defaultValue: 'latest',    description: 'Tag de la imagen')
 
     // K8s / Helm
-    string(name: 'NAMESPACE',     defaultValue: 'pythonapp', description: 'Namespace destino')
-    string(name: 'RELEASE_NAME',  defaultValue: 'pythonapp', description: 'Nombre del release Helm')
-    string(name: 'REPLICAS',      defaultValue: '1',         description: 'Réplicas')
-    string(name: 'SERVICE_TYPE',  defaultValue: 'NodePort',  description: 'Service type (NodePort/ClusterIP)')
-    string(name: 'SERVICE_PORT',  defaultValue: '80',        description: 'Service port (externo)')
-    string(name: 'TARGET_PORT',   defaultValue: '8000',      description: 'Puerto del contenedor (app)')
-    string(name: 'NODE_PORT',     defaultValue: '30080',     description: 'NodePort (si SERVICE_TYPE=NodePort)')
+    string(name: 'NAMESPACE',     defaultValue: 'pythonapp',  description: 'Namespace destino')
+    string(name: 'RELEASE_NAME',  defaultValue: 'pythonapp',  description: 'Nombre del release Helm')
+    string(name: 'REPLICAS',      defaultValue: '1',          description: 'Réplicas')
+    string(name: 'SERVICE_TYPE',  defaultValue: 'NodePort',   description: 'Service type (NodePort/ClusterIP)')
+    string(name: 'SERVICE_PORT',  defaultValue: '80',         description: 'Service port (externo)')
+    string(name: 'TARGET_PORT',   defaultValue: '8000',       description: 'Puerto del contenedor (app)')
+    string(name: 'NODE_PORT',     defaultValue: '30080',      description: 'NodePort (si SERVICE_TYPE=NodePort)')
     booleanParam(name: 'INGRESS_ENABLED', defaultValue: false, description: 'Habilitar Ingress')
     string(name: 'INGRESS_HOST',  defaultValue: 'pythonapp.local', description: 'Host del Ingress')
   }
 
   stages {
-
     stage('Preflight') {
       steps {
         sh '''
           set -e
-          for t in kubectl terraform helm git curl; do
+          for t in terraform helm git curl; do
             command -v $t >/dev/null || { echo "Falta $t en el agente Jenkins: $t"; exit 1; }
           done
         '''
@@ -43,7 +40,7 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Terraform apply / destroy (sin Docker)') {
+    stage('Terraform apply/destroy') {
       steps {
         withCredentials([
           string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
@@ -66,7 +63,7 @@ pipeline {
           ]) {
             sh '''
               set -e
-              # Garantiza que el provider NO intente leer kubeconfig
+              # Evita que el provider busque kubeconfig
               unset KUBECONFIG
 
               cd terraform
@@ -82,27 +79,15 @@ pipeline {
       }
     }
 
-    stage('Post-deploy check') {
+    stage('Post-deploy (opcional)') {
       when { expression { params.ACTION == 'deploy' } }
       steps {
-        // Chequeos genéricos (sin Docker/minikube)
-        withCredentials([
-          string(credentialsId: 'K8S_HOST',        variable: 'TF_VAR_k8s_host'),
-          string(credentialsId: 'K8S_CLUSTER_CA',  variable: 'TF_VAR_k8s_cluster_ca'),
-          string(credentialsId: 'K8S_CLIENT_CERT', variable: 'TF_VAR_k8s_client_cert'),
-          string(credentialsId: 'K8S_CLIENT_KEY',  variable: 'TF_VAR_k8s_client_key')
-        ]) {
-          sh '''
-            set -e
-            # Crea kubeconfig temporal en memoria usando creds del provider (opcional):
-            # Como no usamos kubeconfig en Terraform, aquí solo mostramos estado con kubectl si ya tienes contexto configurado;
-            # si no lo tienes, puedes omitir este bloque o usar tu kubeconfig propio.
-            echo "Despliegue aplicado. Info del Service:"
-            kubectl -n "${NAMESPACE}" get svc || true
-            echo "Revision del Deployment:"
-            kubectl -n "${NAMESPACE}" rollout status deploy/${RELEASE_NAME} --timeout=60s || true
-          '''
-        }
+        sh '''
+          set -e
+          echo "Despliegue aplicado. Si dispones de kubectl en el agente, puedes ejecutar checks manuales:"
+          echo "  kubectl -n '${NAMESPACE}' get svc"
+          echo "  kubectl -n '${NAMESPACE}' rollout status deploy/${RELEASE_NAME} --timeout=60s"
+        '''
       }
     }
   }
