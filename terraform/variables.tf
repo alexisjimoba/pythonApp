@@ -75,9 +75,3 @@ variable "kube_insecure" {
   description = "Deshabilitar validación TLS (solo CI/lab)"
   default     = true
 }
-
-variable "kube_insecure" {
-  type        = bool
-  description = "Deshabilitar validación TLS (solo CI/lab)"
-  default     = true
-}
