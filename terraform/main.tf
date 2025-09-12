@@ -1,24 +1,16 @@
-############################################
-# main.tf (completo)
-############################################
+# main.tf — solo providers
 variable "kubeconfig_path" {
-  description = "Ruta al kubeconfig; usa ~ para el home del usuario."
   type        = string
+  description = "Ruta al kubeconfig a usar por los providers"
   default     = "~/.kube/config"
 }
 
-locals {
-  kubeconfig_expanded = pathexpand(var.kubeconfig_path)
-}
-
 provider "kubernetes" {
-  config_path    = local.kubeconfig_expanded
-  config_context = "minikube"
+  config_path = pathexpand(var.kubeconfig_path)
 }
 
 provider "helm" {
   kubernetes {
-    config_path    = local.kubeconfig_expanded
-    config_context = "minikube"
+    config_path = pathexpand(var.kubeconfig_path)
   }
 }
