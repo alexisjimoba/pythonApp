@@ -68,3 +68,15 @@ variable "ingress_host" {
   type    = string
   default = "example.local"
 }
+
+variable "kubeconfig_path" {
+  type        = string
+  description = "Ruta del kubeconfig que usará Terraform"
+  default     = "./.kube/kubeconfig"
+}
+
+variable "kube_insecure" {
+  type        = bool
+  description = "Deshabilitar validación TLS (solo CI/lab)"
+  default     = true
+}
