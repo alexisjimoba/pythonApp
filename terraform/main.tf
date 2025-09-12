@@ -1,17 +1,16 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.30"
-    }
-  }
+# main.tf — solo providers
+variable "kubeconfig_path" {
+  type        = string
+  description = "Ruta al kubeconfig a usar por los providers"
+  default     = "~/.kube/config"
 }
 
-# Usa ~/.kube/config dentro del contenedor (o KUBECONFIG del entorno)
-provider "kubernetes" {}
+provider "kubernetes" {
+  config_path = pathexpand(var.kubeconfig_path)
+}
 
-# Recurso mínimo para validar el plan
-resource "kubernetes_namespace" "pythonapp" {
-  metadata { name = "pythonapp" }
+provider "helm" {
+  kubernetes {
+    config_path = pathexpand(var.kubeconfig_path)
+  }
 }
